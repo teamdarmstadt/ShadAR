@@ -1,0 +1,92 @@
+// GPU Compute Shader for polygon mask rasterization
+// Much faster than CPU scanline fill, especially for high-resolution masks
+#pragma kernel RasterizePolygon
+#pragma kernel ClearTexture
+
+// Output mask texture (R8 single channel)
+RWTexture2D<float> Result;
+
+// Polygon data buffer
+// Each polygon stored as: [numPoints, x0, y0, x1, y1, ...]
+// Coordinates are normalized [0,1] relative to mask bounds
+StructuredBuffer<float> PolygonData;
+
+// Parameters
+int TextureSize;        // Output texture resolution (square)
+int PolygonOffset;      // Offset into PolygonData for this polygon
+int NumPoints;          // Number of vertices in polygon
+
+// Clear kernel - fills texture with zeros
+[numthreads(8, 8, 1)]
+void ClearTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < (uint)TextureSize && id.y < (uint)TextureSize)
+    {
+        Result[id.xy] = 0.0;
+    }
+}
+
+// Point-in-polygon test using ray casting algorithm
+// Returns 1 if point is inside polygon, 0 otherwise
+float PointInPolygon(float2 testPoint, int numPoints, int dataOffset)
+{
+    int inside = 0;
+    
+    float2 p1 = float2(
+        PolygonData[dataOffset],
+        PolygonData[dataOffset + 1]
+    );
+    
+    for (int i = 1; i <= numPoints; i++)
+    {
+        int idx = (i % numPoints) * 2 + dataOffset;
+        float2 p2 = float2(PolygonData[idx], PolygonData[idx + 1]);
+        
+        if (testPoint.y > min(p1.y, p2.y))
+        {
+            if (testPoint.y <= max(p1.y, p2.y))
+            {
+                if (testPoint.x <= max(p1.x, p2.x))
+                {
+                    float xIntersect = (testPoint.y - p1.y) * (p2.x - p1.x) / (p2.y - p1.y) + p1.x;
+                    
+                    if (p1.x == p2.x || testPoint.x <= xIntersect)
+                    {
+                        inside = 1 - inside;
+                    }
+                }
+            }
+        }
+        
+        p1 = p2;
+    }
+    
+    return (float)inside;
+}
+
+// Main rasterization kernel
+// Each thread handles one pixel
+[numthreads(8, 8, 1)]
+void RasterizePolygon(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)TextureSize || id.y >= (uint)TextureSize)
+        return;
+    
+    if (NumPoints < 3)
+    {
+        Result[id.xy] = 0.0;
+        return;
+    }
+    
+    // Convert pixel coordinates to normalized [0,1]
+    // Note: Y is flipped for Unity coordinate system
+    float2 uv = float2(
+        (float)id.x / (float)(TextureSize - 1),
+        1.0 - (float)id.y / (float)(TextureSize - 1)
+    );
+    
+    // Test if point is inside polygon
+    float inside = PointInPolygon(uv, NumPoints, PolygonOffset);
+    
+    Result[id.xy] = inside;
+}

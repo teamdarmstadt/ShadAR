@@ -1,0 +1,55 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "ShadAR"
+abstract: "Real-time prompting of on-demand visual augmentation in augmented reality: an LLM writes shaders that modify the Meta Quest 3 passthrough feed, targeted by object detection."
+type: software
+license: MIT
+repository-code: "https://github.com/teamdarmstadt/ShadAR"
+keywords:
+  - Augmented Reality
+  - Shader
+  - Visual Augmentation
+  - Code Generation
+  - Large Language Model
+authors:
+  - family-names: Hartenstein
+    given-names: Samuel
+    affiliation: "TU Darmstadt"
+  - family-names: Mei
+    given-names: Yanni
+    affiliation: "TU Darmstadt"
+preferred-citation:
+  type: conference-paper
+  title: "ShadAR: Real-time Prompting On-demand Visual Augmentation in Augmented Reality"
+  authors:
+    - family-names: Mei
+      given-names: Yanni
+      affiliation: "TU Darmstadt"
+    - family-names: Hartenstein
+      given-names: Samuel
+      affiliation: "TU Darmstadt"
+    - family-names: Wombacher
+      given-names: Jonas
+      affiliation: "TU Darmstadt"
+    - family-names: Mueller
+      given-names: Florian
+      affiliation: "TU Darmstadt"
+    - family-names: Gugenheimer
+      given-names: Jan
+      affiliation: "TU Darmstadt"
+  collection-title: "The 39th Annual ACM Symposium on User Interface Software and Technology (UIST '26)"
+  publisher:
+    name: "ACM"
+    city: "New York, NY"
+    country: US
+  conference:
+    name: "UIST '26"
+    city: "Detroit, MI"
+    country: US
+    date-start: 2026-11-02
+    date-end: 2026-11-05
+  doi: "10.1145/3830398.3830534"
+  isbn: "979-8-4007-2856-3"
+  year: 2026
+  month: 11
+  pages: 14

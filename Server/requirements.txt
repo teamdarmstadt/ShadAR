@@ -1,0 +1,23 @@
+# Detection server (Server/detection/server.py) — the only service this build needs.
+# Run it directly:  python Server/detection/server.py
+# HTTP :8000 / UDP :8001 / WebSocket :8002 (defaults match the app's ServerConnectionConfig)
+
+fastapi
+uvicorn
+python-multipart      # FastAPI needs it for the UploadFile/File form endpoint
+websockets            # WebSocket transport (the UDP path does not use it)
+
+ultralytics           # YOLOE (open vocabulary) and yolo26-seg (COCO)
+torch
+torchvision           # not imported here, but ultralytics needs it and it must match
+                      # torch's CUDA build — pinned explicitly so pip cannot drift
+numpy
+opencv-python
+pillow>=11.0.0        # because of torchvision
+
+# Optional: lets the loader pick a TensorRT .engine over .onnx/.pt when one exists
+# next to the model (see get_yolo_model's format priority).
+tensorrt
+
+# Optional: only for the legacy opt-in RF-DETR detector (--model rfdetr)
+# inference
