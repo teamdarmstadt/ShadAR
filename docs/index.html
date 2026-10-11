@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShadAR: Real-time Prompting On-demand Visual Augmentation in Augmented Reality</title>
+  <meta name="description" content="ShadAR lets AR users describe a visual augmentation in words; an LLM writes a shader, object detection targets it, and the Meta Quest 3 passthrough view changes in real time. UIST '26.">
+  <meta property="og:title" content="ShadAR: Real-time Prompting On-demand Visual Augmentation in AR">
+  <meta property="og:description" content="Describe a visual augmentation in words and see your surroundings change in real time. UIST '26.">
+  <meta property="og:type" content="website">
+  <meta property="og:image" content="static/images/teaser.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <style>
+    :root {
+      --bg: #ffffff;
+      --text: #1d1d1f;
+      --muted: #5f6368;
+      --line: #e3e3e6;
+      --accent: #1a56db;
+      --button-bg: #1d1d1f;
+      --button-text: #ffffff;
+      --code-bg: #f5f5f7;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121214;
+        --text: #ececee;
+        --muted: #a1a1a8;
+        --line: #2c2c31;
+        --accent: #7aa2ff;
+        --button-bg: #ececee;
+        --button-text: #121214;
+        --code-bg: #1c1c20;
+        color-scheme: dark;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    main { max-width: 920px; margin: 0 auto; padding: 56px 20px 40px; }
+    header { text-align: center; }
+    h1 { font-size: clamp(1.7rem, 4.2vw, 2.5rem); line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.01em; }
+    .subtitle { font-size: clamp(1.05rem, 2.4vw, 1.3rem); color: var(--muted); margin: 0 0 24px; }
+    .authors { margin: 0; font-size: 1.05rem; }
+    .authors span { white-space: nowrap; }
+    .authors span:not(:last-child)::after { content: ","; }
+    .affiliation, .venue { margin: 4px 0 0; color: var(--muted); }
+    .links { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin: 26px 0 8px; }
+    .links a {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 9px 18px; border-radius: 999px;
+      background: var(--button-bg); color: var(--button-text);
+      text-decoration: none; font-weight: 600; font-size: 0.95rem;
+    }
+    .links a:hover { opacity: 0.85; }
+    .links svg { width: 18px; height: 18px; fill: currentColor; }
+    figure { margin: 36px 0; }
+    figure img { width: 100%; height: auto; display: block; border-radius: 6px; }
+    figcaption { margin-top: 10px; color: var(--muted); font-size: 0.93rem; }
+    section { margin-top: 48px; }
+    h2 { font-size: 1.45rem; margin: 0 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+    p { margin: 0 0 14px; }
+    a { color: var(--accent); }
+    .bibtex { display: flex; flex-direction: column; }
+    pre {
+      margin: 0; padding: 16px 18px; overflow-x: auto;
+      background: var(--code-bg); border-radius: 6px;
+      font: 0.85rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .copy {
+      align-self: flex-end; margin-bottom: 6px;
+      padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px;
+      background: var(--bg); color: var(--text); font: inherit; font-size: 0.8rem; cursor: pointer;
+    }
+    footer { margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>ShadAR</h1>
+    <p class="subtitle">Real-time Prompting On-demand Visual Augmentation in Augmented Reality</p>
+    <p class="authors">
+      <span>Yanni Mei</span>
+      <span>Samuel Hartenstein</span>
+      <span>Jonas Wombacher</span>
+      <span>Florian Mueller</span>
+      <span>Jan Gugenheimer</span>
+    </p>
+    <p class="affiliation">TU Darmstadt</p>
+    <p class="venue">UIST '26 · Detroit, MI, USA</p>
+    <nav class="links">
+      <a href="https://doi.org/10.1145/3830398.3830534">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 2h9l5 5v15H6zM14 3.5V8h4.5zM8.5 12h9v1.6h-9zm0 3.2h9v1.6h-9zm0 3.2h6v1.6h-6z"/></svg>
+        Paper
+      </a>
+      <a href="https://github.com/teamdarmstadt/ShadAR">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 .5a11.5 11.5 0 0 0-3.64 22.41c.58.1.79-.25.79-.56v-2c-3.2.7-3.88-1.37-3.88-1.37-.52-1.33-1.28-1.69-1.28-1.69-1.05-.71.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.77 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.41-2.7 5.38-5.26 5.67.41.36.78 1.06.78 2.14v3.17c0 .31.21.67.8.56A11.5 11.5 0 0 0 12 .5z"/></svg>
+        Code
+      </a>
+      <a href="#citation">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h4v4H8.5c0 1.9.9 3 2.5 3.3V16c-2.8-.3-4-2.3-4-5.4zm7 0h4v4h-2.5c0 1.9.9 3 2.5 3.3V16c-2.8-.3-4-2.3-4-5.4z"/></svg>
+        BibTeX
+      </a>
+    </nav>
+  </header>
+
+  <figure>
+    <img src="static/images/teaser.jpg" width="2000" height="1305"
+         alt="A user wearing a Meta Quest 3 asks to turn a book into dark mode; the system segments the book, generates a shader and shows the book in inverted colors. Further examples: red-green color blindness, pencil sketch style, an enlarged stop sign, and a line measuring the distance between two hands.">
+    <figcaption>ShadAR turns a spoken request such as “Turn the book into dark mode” into a pixel
+      shader that an object detector aims at the right region of the passthrough view. Further
+      examples: (B) simulating red-green color blindness, (C) a pencil-sketch room, (D) a larger
+      stop sign, (E) a line showing the distance between two hands.</figcaption>
+  </figure>
+
+  <section>
+    <h2>Abstract</h2>
+    <p>Augmented Reality can reshape our visual perception (e.g., simulating color blindness) yet
+      such effects are typically pre-programmed by experts, making visual augmentation static and
+      inflexible. We introduce ShadAR, an AR system that allows users to describe expected visual
+      augmentations (e.g., "Blur all people") for changing their vision in real time. ShadAR can
+      graphically manipulate AR passthrough real-time via shader injection. When receiving a user’s
+      prompt, ShadAR uses LLMs (GPT5.2) to interpret the user’s intent, analyzes the user’s view
+      with object detection (YOLOv26), generates a pixel shader, and applies it to the targeted
+      region on AR passthrough. To understand usage pattern, we invited 21 HCI researchers to use
+      ShadAR, identifying four application domains (design, health, productivity, and social
+      interaction) and two prompt-framing patterns: <em>procedural prompts</em> specifying what to
+      modify and how (“Highlight the book.”), and <em>end-goal prompts</em> conveying desired
+      mental/behavioral states (“Make me laugh.”). Such end-goal prompts suggest a future in which
+      users specify outcomes (e.g., “Make me not miss my flight”) while the system determines how
+      to realize them, though often with inherently indeterminate results. We discuss design
+      opportunities for ShadAR and ethical concerns.</p>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <p>The headset records the spoken prompt and sends it, transcribed, to an LLM that writes an
+      HLSL pixel shader. A separate Unity instance on a PC compiles the shader into an asset bundle,
+      which the headset loads at runtime. In parallel, every passthrough frame is streamed to an
+      object detector on the PC; its boxes and segmentation masks come back as GPU buffers, so the
+      shader can restrict its effect to exactly the objects the prompt is about.</p>
+    <figure>
+      <img src="static/images/pipeline.jpg" width="2000" height="835" loading="lazy"
+           alt="Pipeline diagram: voice command and one frame go through speech transcription, the shader generator and the shader compiler; each passthrough frame goes through object detection and a detection-result translator; both feed the reprogrammable AR view on the Quest 3.">
+      <figcaption>Shader generation (top) and real-world detection (bottom) run independently and
+        meet in the reprogrammable AR view on the Quest 3.</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>What people asked for</h2>
+    <p>In a workshop, 21 HCI researchers used ShadAR in four domains: as a design tool, for health
+      interventions, for personal productivity and for social interaction.</p>
+    <figure>
+      <img src="static/images/scenarios.jpg" width="2000" height="941" loading="lazy"
+           alt="Ten workshop examples with their prompts, among them mirroring the world upside down, recoloring boxes, summer foliage, making cake less attractive than broccoli, focusing on a laptop, finding a phone, blurring a person, a heart bubble around two people, and pixelating a screen.">
+      <figcaption>Prompts from the workshop, grouped by domain. Faces in (H) and (I) were
+        anonymized by the authors.</figcaption>
+    </figure>
+    <p>Besides procedural prompts that say what to change, participants wrote end-goal prompts
+      that only describe the desired state, leaving the effect itself to the system.</p>
+    <figure>
+      <img src="static/images/end-goal-prompts.jpg" width="1600" height="1013" loading="lazy"
+           alt="Four generated effects: neon halos with fluid distortion, a kaleidoscopic double vision, googly eyes on a television, and a jittering, misaligned view.">
+      <figcaption>End-goal prompts: two different results for “Make me feel as if I am on an LSD
+        trip” (A, B), “Make me laugh” (C) and “Surprise me” (D).</figcaption>
+    </figure>
+  </section>
+
+  <section>
+    <h2>Code</h2>
+    <p>The Unity app for Meta Quest 3, the detection server and setup instructions are on
+      <a href="https://github.com/teamdarmstadt/ShadAR">GitHub</a>. The repository has been
+      developed further since the paper (stereo rendering, open-vocabulary detection); its README
+      lists the differences and how to approximate the setup from the paper.</p>
+  </section>
+
+  <section id="citation">
+    <h2>Citation</h2>
+    <div class="bibtex">
+      <button class="copy" type="button" hidden>Copy</button>
+<pre><code id="bibtex">@inproceedings{mei2026shadar,
+  author    = {Mei, Yanni and Hartenstein, Samuel and Wombacher, Jonas and Mueller, Florian and Gugenheimer, Jan},
+  title     = {ShadAR: Real-time Prompting On-demand Visual Augmentation in Augmented Reality},
+  booktitle = {The 39th Annual ACM Symposium on User Interface Software and Technology (UIST '26)},
+  year      = {2026},
+  month     = nov,
+  location  = {Detroit, MI, USA},
+  publisher = {ACM},
+  address   = {New York, NY, USA},
+  numpages  = {14},
+  doi       = {10.1145/3830398.3830534}
+}</code></pre>
+    </div>
+  </section>
+
+  <footer>
+    Figures are taken from the paper, © 2026 the authors, licensed under
+    <a href="https://creativecommons.org/licenses/by-nc-nd/4.0/">CC BY-NC-ND 4.0</a>.
+  </footer>
+</main>
+<script>
+  // Copy button only appears where the Clipboard API is available.
+  const button = document.querySelector('.copy');
+  if (navigator.clipboard) {
+    button.hidden = false;
+    button.addEventListener('click', async () => {
+      await navigator.clipboard.writeText(document.getElementById('bibtex').textContent);
+      button.textContent = 'Copied';
+      setTimeout(() => { button.textContent = 'Copy'; }, 1500);
+    });
+  }
+</script>
+</body>
+</html>
