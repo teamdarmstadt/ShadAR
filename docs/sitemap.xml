@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+  <url>
+    <loc>https://teamdarmstadt.github.io/ShadAR/</loc>
+    <lastmod>2026-11-04</lastmod>
+    <image:image><image:loc>https://teamdarmstadt.github.io/ShadAR/static/images/teaser.jpg</image:loc></image:image>
+    <image:image><image:loc>https://teamdarmstadt.github.io/ShadAR/static/images/pipeline.jpg</image:loc></image:image>
+    <image:image><image:loc>https://teamdarmstadt.github.io/ShadAR/static/images/scenarios.jpg</image:loc></image:image>
+    <image:image><image:loc>https://teamdarmstadt.github.io/ShadAR/static/images/end-goal-prompts.jpg</image:loc></image:image>
+  </url>
+</urlset>

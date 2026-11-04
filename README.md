@@ -12,6 +12,10 @@ the headset — in stereo, in real time.
 > Yanni Mei, Samuel Hartenstein, Jonas Wombacher, Florian Mueller, Jan Gugenheimer (TU Darmstadt)<br>
 > UIST '26 · [doi:10.1145/3830398.3830534](https://doi.org/10.1145/3830398.3830534) ·
 > [Project page](https://teamdarmstadt.github.io/ShadAR/)
+>
+> Earlier versions: *ShadAR: LLM-driven shader generation to transform visual perception in Augmented Reality*,
+> ISMAR 2025 Adjunct · [doi:10.1109/ISMAR-Adjunct68609.2025.00267](https://doi.org/10.1109/ISMAR-Adjunct68609.2025.00267) · [arXiv:2602.17481](https://arxiv.org/abs/2602.17481);
+> CHI 2026 Interactivity (CHI EA '26) · [doi:10.1145/3772363.3799378](https://doi.org/10.1145/3772363.3799378)
 
 ## How it works
 
