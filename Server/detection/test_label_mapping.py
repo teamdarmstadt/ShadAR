@@ -31,6 +31,8 @@ def load_mapping():
         or (isinstance(n, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id in ("COCO_SYNONYMS", "COCO_NAME_TO_ID")
             for t in n.targets))
+        or (isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+            and n.target.id in ("COCO_SYNONYMS", "COCO_NAME_TO_ID"))
     ]
     found = {n.name for n in body if isinstance(n, ast.FunctionDef)}
     assert WANTED <= found, f"missing from server.py: {WANTED - found}"
@@ -108,6 +110,11 @@ def main():
     # "-" / empty means the LLM found no equivalent: that slot maps to nothing, and the
     # phrase must NOT quietly fall back to name matching, or the LLM's decision is moot.
     assert slots(["dragon", "chair"], ["", "chair"]) == {chair: 1}
+    assert slots(["human face", "chair"], ["-", "chair"]) == {chair: 1}
+    assert slots(["human face", "chair"], ["", "chair"]) == {chair: 1}
+    # A '-' slot whose phrase happens to contain a COCO word ("tv" in "tv stand") must NOT
+    # fall back to name matching and steal 'tv' from a later slot that explicitly asked for it.
+    assert slots(["tv stand", "television"], ["-", "tv"]) == {tv: 1}
 
     # A hallucinated COCO class falls back to name matching for that slot rather than
     # poisoning the map.

@@ -95,7 +95,9 @@ _active_vocabulary: List[str] = []
 _active_vocabulary_confidence: float = 0.25
 _applied_vocabulary_key: Optional[str] = None  # guards redundant text-embedding recompute
 _vocabulary_status: str = "none"  # none | empty | applied | not_open_vocab | error
-_vocabulary_lock = threading.Lock()
+# Re-entrant lock serializing model inference against set_classes() / detector switches across
+# UDP, HTTP, and WebSocket threads (switch_detector -> load_model -> apply_vocabulary re-enters).
+_vocabulary_lock = threading.RLock()
 
 # {model class index -> shader slot} for the CLOSED-vocabulary detector, rebuilt whenever the
 # vocabulary or the detector changes. Precomputed so the per-frame path is a dict lookup
@@ -218,6 +220,8 @@ def apply_vocabulary(classes: List[str], confidence: Optional[float] = None,
 
         if active_model_type == "yoloe" and active_model is not None:
             if not cleaned:
+                _yoloe_prompt_slots = []
+                _applied_vocabulary_key = None
                 _vocabulary_status = "empty"
             elif key == _applied_vocabulary_key:
                 _vocabulary_status = "applied"  # the model still holds exactly these prompts
@@ -225,6 +229,7 @@ def apply_vocabulary(classes: List[str], confidence: Optional[float] = None,
                 try:
                     active_model.set_classes(prompts, active_model.get_text_pe(prompts))
                     _yoloe_prompt_slots = prompt_slots
+                    _applied_vocabulary_key = key
                     _vocabulary_status = "applied"
                     logger.info(f"YOLOE vocabulary applied ({len(cleaned)} slots): {prompts} -> slots {prompt_slots}")
                 except Exception as e:
@@ -235,7 +240,6 @@ def apply_vocabulary(classes: List[str], confidence: Optional[float] = None,
                         f"must run FP32), or MobileCLIP text encoder unavailable "
                         f"('mobileclip2_b.ts' download blocked / no internet)."
                     )
-                _applied_vocabulary_key = key
             _coco_slot_map = {}  # open vocab needs no translation
         else:
             # Closed vocabulary (yolo26-seg on COCO): the model cannot be told what to look
@@ -300,17 +304,21 @@ def switch_detector(model_type: str) -> bool:
     if model_type == active_model_type:
         return False
 
-    previous = active_model_type
-    try:
-        load_model(model_type, yolo_model=_yolo_model_name_arg, yoloe_model=_yoloe_model_name_arg)
-    except Exception as e:
-        # Keep serving with the previous detector rather than dropping to no model at all.
-        logger.error(f"Detector switch to '{model_type}' FAILED, staying on '{previous}': {e}")
-        active_model_type = previous
-        return False
+    with _vocabulary_lock:
+        if model_type == active_model_type:
+            return False
 
-    logger.info(f"Detector switched: {previous} -> {active_model_type}")
-    return True
+        previous = active_model_type
+        try:
+            load_model(model_type, yolo_model=_yolo_model_name_arg, yoloe_model=_yoloe_model_name_arg)
+        except Exception as e:
+            # Keep serving with the previous detector rather than dropping to no model at all.
+            logger.error(f"Detector switch to '{model_type}' FAILED, staying on '{previous}': {e}")
+            active_model_type = previous
+            return False
+
+        logger.info(f"Detector switched: {previous} -> {active_model_type}")
+        return True
 
 
 # Synonyms for the closed COCO vocabulary. A generated shader asks in natural language
@@ -385,9 +393,11 @@ def build_coco_slot_map(vocabulary, class_names, coco_classes=None) -> dict:
     if coco_classes and len(coco_classes) == len(vocabulary):
         for slot, coco_name in enumerate(coco_classes):
             key = (coco_name or "").strip().lower()
-            if not key:
-                continue  # the LLM said "no COCO equivalent" for this slot
-            if key in by_name:
+            if key in ("", "-", "none"):
+                # The LLM explicitly declared "no COCO equivalent": record None so Pass 1 does
+                # NOT silently fall back to name/synonym matching and steal a class.
+                explicit[slot] = None
+            elif key in by_name:
                 explicit[slot] = by_name[key]
             else:
                 logger.warning(
@@ -404,7 +414,8 @@ def build_coco_slot_map(vocabulary, class_names, coco_classes=None) -> dict:
     candidates = {}
     for slot, wanted in enumerate(vocabulary):
         if slot in explicit:
-            candidates[slot] = {explicit[slot]}
+            if explicit[slot] is not None:
+                candidates[slot] = {explicit[slot]}
             continue
 
         wanted_words = _words(wanted)
@@ -450,6 +461,10 @@ def build_coco_slot_map(vocabulary, class_names, coco_classes=None) -> dict:
                 f"COCO mapping: '{wanted}' (slot {slot}) stays EMPTY — {detail}. A detection "
                 f"carries one slot only, so two phrases cannot share a COCO class. Merge them "
                 f"in the shader, or use the open-vocabulary detector to tell them apart."
+            )
+        elif slot in explicit and explicit[slot] is None:
+            logger.info(
+                f"COCO mapping: '{wanted}' (slot {slot}) intentionally skipped (shader @detect-coco='-')."
             )
         elif _words(wanted):
             logger.warning(
@@ -684,22 +699,26 @@ udp_max_polygon_points = 64  # Simplify polygons for bandwidth
 def simplify_polygon(points: np.ndarray, max_points: int = 64) -> np.ndarray:
     """
     Simplify a polygon using Douglas-Peucker algorithm to reduce point count.
-    This dramatically reduces data size while preserving shape.
+    Scales epsilon relative to contour arc length so pixel-space contours converge
+    quickly while preserving sharp geometric corners.
     """
     if len(points) <= max_points:
         return points
-    
-    # Use cv2.approxPolyDP for Douglas-Peucker simplification
-    # Start with a small epsilon and increase until we get target point count
-    epsilon = 0.001
-    for _ in range(20):
-        simplified = cv2.approxPolyDP(points.astype(np.float32), epsilon, True)
-        if len(simplified) <= max_points:
-            return simplified.reshape(-1, 2)
-        epsilon *= 1.5
-    
-    # Fallback: uniform sampling if simplification fails
-    indices = np.linspace(0, len(points) - 1, max_points, dtype=int)
+
+    pts_f32 = points.astype(np.float32)
+    perimeter = float(cv2.arcLength(pts_f32, True))
+    if perimeter > 0.0:
+        epsilon = max(0.5, 0.0015 * perimeter)
+        for _ in range(16):
+            simplified = cv2.approxPolyDP(pts_f32, epsilon, True)
+            if 3 <= len(simplified) <= max_points:
+                return simplified.reshape(-1, 2)
+            if len(simplified) < 3:
+                break
+            epsilon *= 1.4
+
+    # Fallback: uniform sampling around the closed contour without duplicating start/end
+    indices = np.linspace(0, len(points), max_points, endpoint=False, dtype=int)
     return points[indices]
 
 
@@ -707,6 +726,30 @@ def simplify_polygon(points: np.ndarray, max_points: int = 64) -> np.ndarray:
 # rasterized mask never touches the cell border (prevents the hard cut-off edges that
 # happen when the mask is clamped to the tight YOLO detection box).
 MASK_BOX_MARGIN = 0.06
+
+
+def unpad_letterbox_mask(mask_data: np.ndarray, img_width: int, img_height: int) -> np.ndarray:
+    """
+    Strip Ultralytics LetterBox padding bars from a raw prototype mask (shape H_m x W_m)
+    so non-square frames (4:3, 16:9, especially on fixed-square TensorRT/ONNX engines)
+    map 1:1 onto the original image aspect ratio instead of squashing vertically.
+    """
+    if mask_data.ndim != 2 or img_width <= 0 or img_height <= 0:
+        return mask_data
+
+    mh, mw = mask_data.shape
+    gain = min(mh / float(img_height), mw / float(img_width))
+    pad_x = (mw - img_width * gain) * 0.5
+    pad_y = (mh - img_height * gain) * 0.5
+
+    top = max(0, int(round(pad_y - 0.1)))
+    left = max(0, int(round(pad_x - 0.1)))
+    bottom = min(mh, int(round(mh - pad_y + 0.1)))
+    right = min(mw, int(round(mw - pad_x + 0.1)))
+
+    if bottom > top and right > left and (top > 0 or left > 0 or bottom < mh or right < mw):
+        return mask_data[top:bottom, left:right]
+    return mask_data
 
 
 def extract_polygon_from_mask(mask_data: np.ndarray, img_width: int, img_height: int,
@@ -719,48 +762,43 @@ def extract_polygon_from_mask(mask_data: np.ndarray, img_width: int, img_height:
     being clipped to the detection box and (b) makes the mask fill its atlas cell, so
     the effective mask resolution is higher. The adjusted box is returned so the caller
     can update the detection's bounding box to match (shader gate + mask stay aligned).
-
-    Args:
-        mask_data: Binary mask array from YOLO
-        img_width, img_height: Original image dimensions
-        bbox_norm: Normalized detection bounding box (cx, cy, w, h) — fallback only
-        max_points: Maximum polygon points after simplification
-
-    Returns:
-        (normalized_points, (cx, cy, w, h)) where points are 0-1 relative to the
-        returned (mask-tight) box and the box is normalized to the image, or None.
     """
     try:
-        # Resize mask to image dimensions
-        mask_full = cv2.resize(
-            mask_data.astype(np.float32),
-            (img_width, img_height),
-            interpolation=cv2.INTER_LINEAR
-        )
+        unpadded = unpad_letterbox_mask(mask_data, img_width, img_height)
+        uh, uw = unpadded.shape
+        if uh <= 0 or uw <= 0:
+            return None
 
-        # Threshold to binary
-        mask_binary = (mask_full > 0.5).astype(np.uint8) * 255
+        # Upscale small prototype masks modestly (~320px max side) for smooth 0.5-isoline
+        # contours without paying the cost of resizing every mask to full camera resolution.
+        max_side = max(uw, uh)
+        if max_side < 320 and max(img_width, img_height) > max_side:
+            scale = min(320.0 / max_side, float(max(img_width, img_height)) / max_side)
+            work_w = max(1, int(round(uw * scale)))
+            work_h = max(1, int(round(uh * scale)))
+            mask_work = cv2.resize(
+                unpadded.astype(np.float32),
+                (work_w, work_h),
+                interpolation=cv2.INTER_LINEAR
+            )
+        else:
+            work_w, work_h = uw, uh
+            mask_work = unpadded
+
+        mask_binary = (mask_work > 0.5).astype(np.uint8) * 255
 
         # Find contours
         contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         if not contours:
             return None
 
-        # Get largest contour (main object)
         largest_contour = max(contours, key=cv2.contourArea)
-
         if len(largest_contour) < 3:
             return None
 
-        # Reshape to (N, 2)
         points = largest_contour.reshape(-1, 2).astype(np.float32)
-
-        # Simplify polygon
         points = simplify_polygon(points, max_points)
 
-        # Tight box around the mask contour (pixels), expanded by a small margin and
-        # clamped to the image. This replaces clamping to the YOLO detection box.
         min_x = float(points[:, 0].min())
         min_y = float(points[:, 1].min())
         max_x = float(points[:, 0].max())
@@ -773,26 +811,23 @@ def extract_polygon_from_mask(mask_data: np.ndarray, img_width: int, img_height:
 
         bx1 = max(0.0, min_x - pad_x)
         by1 = max(0.0, min_y - pad_y)
-        bx2 = min(float(img_width), max_x + pad_x)
-        by2 = min(float(img_height), max_y + pad_y)
+        bx2 = min(float(work_w), max_x + pad_x)
+        by2 = min(float(work_h), max_y + pad_y)
 
         box_w = max(bx2 - bx1, 1.0)
         box_h = max(by2 - by1, 1.0)
 
-        # Normalize polygon points into the mask-tight box (no clipping needed: the box
-        # contains the contour by construction).
         normalized_points = []
         for px, py in points:
             nx = min(max((px - bx1) / box_w, 0.0), 1.0)
             ny = min(max((py - by1) / box_h, 0.0), 1.0)
             normalized_points.append([float(nx), float(ny)])
 
-        # Adjusted detection box (center form), normalized to the image.
         adj_box = (
-            ((bx1 + bx2) * 0.5) / img_width,
-            ((by1 + by2) * 0.5) / img_height,
-            box_w / img_width,
-            box_h / img_height,
+            ((bx1 + bx2) * 0.5) / work_w,
+            ((by1 + by2) * 0.5) / work_h,
+            box_w / work_w,
+            box_h / work_h,
         )
 
         return normalized_points, adj_box
@@ -859,8 +894,8 @@ async def detect(
         detections = []
         
         if active_model_type == "rfdetr":
-            # RF-DETR inference
-            predictions = active_model.infer(image, confidence=confidence)[0]
+            with _vocabulary_lock:
+                predictions = active_model.infer(image, confidence=confidence)[0]
             
             for pred in predictions.predictions:
                 # Normalize and convert to center format
@@ -887,16 +922,21 @@ async def detect(
             print(f"[RF-DETR] Processed image {img_width}x{img_height}, found {len(detections)} objects")
         
         else:
-            # YOLO inference with FP16 on CUDA
-            # YOLOE must run FP32: half-precision inference flips the model to Half,
-            # but set_classes/get_text_pe produce Float text embeddings -> dtype mismatch.
-            use_half = _device == "cuda" and active_model_type != "yoloe"
-            results = active_model(image, conf=confidence, half=use_half, agnostic_nms=_agnostic_nms())
-            
+            with _vocabulary_lock:
+                if active_model_type == "yoloe" and not _active_vocabulary:
+                    results = []
+                else:
+                    # YOLO inference with FP16 on CUDA
+                    # YOLOE must run FP32: half-precision inference flips the model to Half,
+                    # but set_classes/get_text_pe produce Float text embeddings -> dtype mismatch.
+                    use_half = _device == "cuda" and active_model_type != "yoloe"
+                    results = active_model(image, conf=confidence, verbose=False, half=use_half, agnostic_nms=_agnostic_nms())
+
             for result in results:
                 boxes = result.boxes
                 masks = result.masks
-                
+                masks_np = None
+
                 for i, box in enumerate(boxes):
                     xywhn = box.xywhn[0].tolist()
                     conf = float(box.conf[0])
@@ -921,7 +961,9 @@ async def detect(
                     # Include segmentation mask if requested and available
                     if include_masks and masks is not None and i < len(masks) and mask_format != MaskFormat.NONE:
                         try:
-                            mask_data = masks.data[i].cpu().numpy()  # Shape: (mask_h, mask_w) - masks.data is tensor [N, H, W]
+                            if masks_np is None:
+                                masks_np = masks.data.cpu().numpy()
+                            mask_data = masks_np[i]
                             bbox_norm = (xywhn[0], xywhn[1], xywhn[2], xywhn[3])
                             
                             if mask_format == MaskFormat.POLYGON:
@@ -947,15 +989,14 @@ async def detect(
                                     detection["mask_polygon"] = flat_polygon
                                     detection["mask_polygon_count"] = len(polygon)
                                     detection["mask_format"] = "polygon"
-                                    polygon_bytes = len(flat_polygon) * 4  # Approximate size
-                                    print(f"    [POLYGON] {label}: {len(polygon)} points (~{polygon_bytes} bytes)")
                                     
                             elif mask_format == MaskFormat.RLE:
                                 # ================================================
                                 # RLE FORMAT - Lossless compression
                                 # ================================================
+                                mask_unpadded = unpad_letterbox_mask(mask_data, img_width, img_height)
                                 mask_full = cv2.resize(
-                                    mask_data.astype(np.float32),
+                                    mask_unpadded.astype(np.float32),
                                     (img_width, img_height),
                                     interpolation=cv2.INTER_LINEAR
                                 )
@@ -970,7 +1011,6 @@ async def detect(
                                 
                                 if x2 > x1 and y2 > y1:
                                     mask_cropped = mask_binary[y1:y2, x1:x2]
-                                    # Resize to standard size for consistent decoding
                                     mask_resized = cv2.resize(mask_cropped, (mask_resolution, mask_resolution), 
                                                             interpolation=cv2.INTER_NEAREST)
                                     rle_data = encode_rle(mask_resized)
@@ -979,14 +1019,14 @@ async def detect(
                                     detection["mask_width"] = mask_resolution
                                     detection["mask_height"] = mask_resolution
                                     detection["mask_format"] = "rle"
-                                    print(f"    [RLE] {label}: {len(rle_data)} chars")
                                     
                             else:  # MaskFormat.RASTER
                                 # ================================================
                                 # RASTER FORMAT - Original (large but exact)
                                 # ================================================
+                                mask_unpadded = unpad_letterbox_mask(mask_data, img_width, img_height)
                                 mask_full = cv2.resize(
-                                    mask_data.astype(np.float32),
+                                    mask_unpadded.astype(np.float32),
                                     (img_width, img_height),
                                     interpolation=cv2.INTER_LINEAR
                                 )
@@ -1010,9 +1050,6 @@ async def detect(
                                     detection["mask_width"] = mask_resolution
                                     detection["mask_height"] = mask_resolution
                                     detection["mask_format"] = "raw"
-                                    
-                                    raster_bytes = mask_resolution * mask_resolution
-                                    print(f"    [RASTER] {label}: {mask_resolution}x{mask_resolution} ({raster_bytes} bytes)")
                                     
                         except Exception as mask_error:
                             import traceback
@@ -1189,7 +1226,7 @@ def process_udp_detection(image_bytes: bytes, frame_id: int,
     Response: [frame_id:4][num_detections:2][detections...]
     
     Detection format:
-    [label_id:2][x:4][y:4][w:4][h:4][conf:4][num_points:2][polygon_points...]
+    [label_id:2][x:4][y:4][w:4][h:4][conf:2][num_points:2][polygon_points...]
     Polygon points: [x:2][y:2] as uint16 (0-65535 normalized)
     
     Parameters from client are used, but server command-line args override if set differently from defaults.
@@ -1237,48 +1274,62 @@ def process_udp_detection(image_bytes: bytes, frame_id: int,
         num_detections = 0
 
         if active_model_type in ("yolo", "yoloe"):
-            # YOLO / YOLOE inference with FP16 on CUDA. For YOLOE the class indices
-            # are slot indices into the active vocabulary (set via /configure).
-            # YOLOE must run FP32: half-precision inference flips the model to Half,
-            # but set_classes/get_text_pe produce Float text embeddings -> dtype mismatch.
-            use_half = _device == "cuda" and active_model_type != "yoloe"
-            results = active_model(image, conf=effective_confidence, half=use_half, agnostic_nms=_agnostic_nms())
-            
-            for result in results:
+            with _vocabulary_lock:
+                # Short-circuit open-vocabulary YOLOE when no target classes are active so idle
+                # passthrough / full-screen shaders do not burn FP32 GPU inference or return stale slots.
+                if active_model_type == "yoloe" and not _active_vocabulary:
+                    return struct.pack('<IH', frame_id, 0)
+
+                # YOLOE must run FP32: half-precision inference flips the model to Half,
+                # but set_classes/get_text_pe produce Float text embeddings -> dtype mismatch.
+                use_half = _device == "cuda" and active_model_type != "yoloe"
+                results = active_model(
+                    image,
+                    conf=effective_confidence,
+                    verbose=False,
+                    half=use_half,
+                    agnostic_nms=_agnostic_nms(),
+                )
+                active_names_list = [
+                    (result, [resolve_label_id(int(box.cls[0]), result.names) for box in result.boxes])
+                    for result in results
+                ]
+
+            MAX_UDP_PAYLOAD = 65000
+
+            for result, resolved_labels in active_names_list:
                 boxes = result.boxes
                 masks = result.masks
-                
+                masks_np = None
+
                 has_masks = masks is not None and len(masks) > 0
                 if len(boxes) > 0 and not has_masks:
                     print(f"[UDP] Warning: No masks available! Make sure you're using a -seg model (e.g., yolo26n-seg.pt)")
-                
-                for i, box in enumerate(boxes):
-                    xywhn = box.xywhn[0].tolist()
-                    conf = float(box.conf[0])
-                    cls = int(box.cls[0])
 
-                    # Closed-vocab detectors return COCO ids; map them onto the shader's slots.
-                    # Done BEFORE the mask work below so a dropped detection costs no polygon
-                    # extraction — this is the per-frame hot path.
-                    label_id = resolve_label_id(cls, result.names)
-                    if label_id < 0:
+                for i, box in enumerate(boxes):
+                    label_id = resolved_labels[i]
+                    if label_id < 0 or label_id > 0xFFFF:
                         continue
+
+                    xywhn = box.xywhn[0].tolist()
+                    conf = min(max(float(box.conf[0]), 0.0), 1.0)
 
                     # Box defaults to the YOLO detection box; overridden below by the
                     # mask-tight box when a polygon is extracted (keeps gate + mask aligned).
-                    box = [xywhn[0], xywhn[1], xywhn[2], xywhn[3]]
+                    det_box = [xywhn[0], xywhn[1], xywhn[2], xywhn[3]]
 
-                    # Extract polygon if masks requested and available
                     polygon_data = bytearray()
                     num_points = 0
 
-                    # Check mask conditions using effective parameters
                     mask_available = masks is not None and i < len(masks.data)
                     format_is_polygon = effective_mask_format == MaskFormat.POLYGON
 
                     if mask_available and format_is_polygon and effective_request_masks:
                         try:
-                            mask_data = masks.data[i].cpu().numpy()  # Shape: (mask_h, mask_w) - note: masks.data not masks[i].data
+                            # Batch GPU->CPU transfer once per frame on the first kept detection.
+                            if masks_np is None:
+                                masks_np = masks.data.cpu().numpy()
+                            mask_data = masks_np[i]
                             bbox_norm = (xywhn[0], xywhn[1], xywhn[2], xywhn[3])
                             poly_result = extract_polygon_from_mask(
                                 mask_data, img_width, img_height,
@@ -1287,31 +1338,29 @@ def process_udp_detection(image_bytes: bytes, frame_id: int,
 
                             if poly_result:
                                 polygon, adj_box = poly_result
-                                box = list(adj_box)
+                                det_box = list(adj_box)
                                 num_points = len(polygon)
                                 for px, py in polygon:
-                                    # Pack as uint16 (0-65535) for efficiency
                                     polygon_data.extend(struct.pack('<HH',
-                                        int(px * 65535),
-                                        int(py * 65535)
+                                        int(round(min(max(px, 0.0), 1.0) * 65535)),
+                                        int(round(min(max(py, 0.0), 1.0) * 65535))
                                     ))
-                            else:
-                                print(f"[UDP] Warning: Polygon extraction returned None for detection {i}")
                         except Exception as e:
                             print(f"[UDP] Error extracting polygon: {e}")
 
-                    # Pack detection data (after possible box adjustment from the mask).
-                    # Format: H=uint16(label), f=float(x), f=float(y), f=float(w), f=float(h), H=uint16(conf)
                     det_data = struct.pack('<HffffH',
-                        label_id,              # slot index the shader filters on (2 bytes)
-                        box[0],                # x center normalized (4 bytes)
-                        box[1],                # y center normalized (4 bytes)
-                        box[2],                # width normalized (4 bytes)
-                        box[3],                # height normalized (4 bytes)
-                        int(conf * 65535)      # confidence as uint16 (2 bytes)
+                        label_id,
+                        det_box[0],
+                        det_box[1],
+                        det_box[2],
+                        det_box[3],
+                        int(round(conf * 65535))
                     )
 
-                    # Append point count and polygon
+                    entry_len = len(det_data) + 2 + len(polygon_data)
+                    if 6 + len(detections_data) + entry_len > MAX_UDP_PAYLOAD or num_detections >= 0xFFFF:
+                        break
+
                     detections_data.extend(det_data)
                     detections_data.extend(struct.pack('<H', num_points))
                     detections_data.extend(polygon_data)
@@ -1395,7 +1444,16 @@ def run_udp_server(host: str, port: int):
             header_format = '<I H H f B B H H'
             frame_id, chunk_idx, total_chunks, confidence, mask_format, request_masks, mask_resolution, max_polygon_points = struct.unpack(header_format, data[:18])
             chunk_data = data[18:]
-            
+
+            if total_chunks == 0 or total_chunks > 512 or chunk_idx >= total_chunks:
+                continue
+
+            now_mono = time.monotonic()
+            if frame_buffers and (len(frame_buffers) > 16 or total_chunks == 1):
+                stale_fids = [fid for fid, entry in frame_buffers.items() if now_mono - entry['created_at'] > 2.0]
+                for fid in stale_fids:
+                    del frame_buffers[fid]
+
             # Store parameters for multi-chunk frames
             params = {
                 'confidence': confidence,
@@ -1404,7 +1462,7 @@ def run_udp_server(host: str, port: int):
                 'mask_resolution': mask_resolution,
                 'max_polygon_points': max_polygon_points
             }
-            
+
             if total_chunks == 1:
                 # Single packet - process immediately with parameters
                 response = process_udp_detection(
@@ -1420,25 +1478,27 @@ def run_udp_server(host: str, port: int):
                 except Exception as send_err:
                     print(f"[UDP] ERROR sending to {addr}: {send_err}")
             else:
-                # Multi-packet frame - reassemble
-                if frame_id not in frame_buffers:
+                # Multi-packet frame - reassemble (reset slot if frame_id wrapped/collided with new total_chunks)
+                existing = frame_buffers.get(frame_id)
+                if existing is None or len(existing['chunks']) != total_chunks:
                     frame_buffers[frame_id] = {
                         'chunks': [None] * total_chunks,
                         'received': 0,
                         'params': params,
-                        'addr': addr
+                        'addr': addr,
+                        'created_at': now_mono,
                     }
-                
+
                 buf = frame_buffers[frame_id]
                 if buf['chunks'][chunk_idx] is None:
                     buf['chunks'][chunk_idx] = chunk_data
                     buf['received'] += 1
-                
+
                 # Check if complete
                 if buf['received'] == total_chunks:
-                    # Reassemble and process with stored parameters
                     full_data = b''.join(buf['chunks'])
                     p = buf['params']
+                    del frame_buffers[frame_id]
                     response = process_udp_detection(
                         full_data, frame_id,
                         confidence=p['confidence'],
@@ -1451,12 +1511,6 @@ def run_udp_server(host: str, port: int):
                         udp_server_socket.sendto(response, buf['addr'])
                     except Exception as send_err:
                         print(f"[UDP] ERROR sending to {buf['addr']}: {send_err}")
-                    del frame_buffers[frame_id]
-                    
-                    # Clean old incomplete frames
-                    old_frames = [fid for fid in frame_buffers if fid < frame_id - 10]
-                    for fid in old_frames:
-                        del frame_buffers[fid]
                         
         except socket.timeout:
             continue
@@ -1519,35 +1573,45 @@ class DetectionWebSocketServer:
         confidence: float = 0.25,
         mask_format: MaskFormat = MaskFormat.POLYGON,
         max_polygon_points: int = 64,
-        request_masks: bool = True
+        request_masks: bool = True,
+        mask_resolution: int = 512
     ) -> List[dict]:
         """Run detection on an image using the active model (YOLO or YOLOE)."""
-        model = get_active_inference_model()
-        img_width, img_height = image.size
-        
-        # Use FP16 half precision on CUDA (but NOT for YOLOE: it would flip the model to
-        # Half while set_classes/get_text_pe produce Float embeddings -> dtype mismatch).
-        use_half = _device == "cuda" and active_model_type != "yoloe"
-        results = model(image, conf=confidence, verbose=False, half=use_half, agnostic_nms=_agnostic_nms())
+        with _vocabulary_lock:
+            if active_model_type == "yoloe" and not _active_vocabulary:
+                return []
+
+            model = get_active_inference_model()
+            img_width, img_height = image.size
+
+            # Use FP16 half precision on CUDA (but NOT for YOLOE: it would flip the model to
+            # Half while set_classes/get_text_pe produce Float embeddings -> dtype mismatch).
+            use_half = _device == "cuda" and active_model_type != "yoloe"
+            results = model(image, conf=confidence, verbose=False, half=use_half, agnostic_nms=_agnostic_nms())
+            resolved_per_result = [
+                (result, [resolve_label_id(int(box.cls[0]), result.names) for box in result.boxes])
+                for result in results
+            ]
+
         detections = []
-        
-        for result in results:
+
+        for result, resolved_labels in resolved_per_result:
             boxes = result.boxes
             masks = result.masks
-            
+            masks_np = None
+
             if boxes is None:
                 continue
-            
+
             for i, box in enumerate(boxes):
+                label_id = resolved_labels[i]
+                if label_id < 0:
+                    continue
+
                 xywhn = box.xywhn[0].tolist()
                 conf = float(box.conf[0])
                 cls = int(box.cls[0])
                 label = result.names[cls]
-
-                # Closed-vocab detectors return COCO ids; map them onto the shader's slots.
-                label_id = resolve_label_id(cls, result.names)
-                if label_id < 0:
-                    continue
 
                 detection = {
                     "label": label,
@@ -1558,13 +1622,15 @@ class DetectionWebSocketServer:
                     "h": xywhn[3],
                     "confidence": conf
                 }
-                
+
                 # Extract mask if requested
                 if request_masks and masks is not None and i < len(masks) and mask_format != MaskFormat.NONE:
                     try:
-                        mask_data = masks.data[i].cpu().numpy()
+                        if masks_np is None:
+                            masks_np = masks.data.cpu().numpy()
+                        mask_data = masks_np[i]
                         bbox_norm = (xywhn[0], xywhn[1], xywhn[2], xywhn[3])
-                        
+
                         if mask_format == MaskFormat.POLYGON:
                             poly_result = extract_polygon_from_mask(
                                 mask_data, img_width, img_height,
@@ -1580,11 +1646,37 @@ class DetectionWebSocketServer:
                                 detection["mask_polygon"] = flat_polygon
                                 detection["mask_polygon_count"] = len(polygon)
                                 detection["mask_format"] = "polygon"
+                        elif mask_format == MaskFormat.RLE:
+                            mask_unpadded = unpad_letterbox_mask(mask_data, img_width, img_height)
+                            mask_full = cv2.resize(mask_unpadded.astype(np.float32), (img_width, img_height), interpolation=cv2.INTER_LINEAR)
+                            mask_binary = (mask_full > 0.5).astype(np.uint8)
+                            cx, cy, w, h = bbox_norm
+                            x1, y1 = max(0, int((cx - w / 2) * img_width)), max(0, int((cy - h / 2) * img_height))
+                            x2, y2 = min(img_width, int((cx + w / 2) * img_width)), min(img_height, int((cy + h / 2) * img_height))
+                            if x2 > x1 and y2 > y1:
+                                mask_resized = cv2.resize(mask_binary[y1:y2, x1:x2], (mask_resolution, mask_resolution), interpolation=cv2.INTER_NEAREST)
+                                detection["mask_rle"] = encode_rle(mask_resized)
+                                detection["mask_width"] = mask_resolution
+                                detection["mask_height"] = mask_resolution
+                                detection["mask_format"] = "rle"
+                        elif mask_format == MaskFormat.RASTER:
+                            mask_unpadded = unpad_letterbox_mask(mask_data, img_width, img_height)
+                            mask_full = cv2.resize(mask_unpadded.astype(np.float32), (img_width, img_height), interpolation=cv2.INTER_LINEAR)
+                            cx, cy, w, h = bbox_norm
+                            x1, y1 = max(0, int((cx - w / 2) * img_width)), max(0, int((cy - h / 2) * img_height))
+                            x2, y2 = min(img_width, int((cx + w / 2) * img_width)), min(img_height, int((cy + h / 2) * img_height))
+                            if x2 > x1 and y2 > y1:
+                                mask_resized = cv2.resize(mask_full[y1:y2, x1:x2], (mask_resolution, mask_resolution), interpolation=cv2.INTER_AREA)
+                                mask_uint8 = np.flipud((np.clip(mask_resized, 0, 1) * 255).astype(np.uint8))
+                                detection["mask"] = base64.b64encode(mask_uint8.tobytes()).decode("utf-8")
+                                detection["mask_width"] = mask_resolution
+                                detection["mask_height"] = mask_resolution
+                                detection["mask_format"] = "raw"
                     except Exception as e:
                         logger.warning(f"Mask extraction failed: {e}")
-                
+
                 detections.append(detection)
-        
+
         return detections
     
     async def handle_client(self, websocket, path=None):
@@ -1675,7 +1767,7 @@ class DetectionWebSocketServer:
                         img_width, img_height = image.size
                         
                         # Run detection in executor to not block event loop
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         detections = await loop.run_in_executor(
                             _executor,
                             lambda: self.run_detection(
@@ -1683,7 +1775,8 @@ class DetectionWebSocketServer:
                                 confidence=state.confidence_threshold,
                                 mask_format=state.mask_format,
                                 max_polygon_points=state.max_polygon_points,
-                                request_masks=state.request_masks
+                                request_masks=state.request_masks,
+                                mask_resolution=state.mask_resolution
                             )
                         )
                         

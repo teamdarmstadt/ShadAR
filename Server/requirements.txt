@@ -7,7 +7,9 @@ uvicorn
 python-multipart      # FastAPI needs it for the UploadFile/File form endpoint
 websockets            # WebSocket transport (the UDP path does not use it)
 
-ultralytics           # YOLOE (open vocabulary) and yolo26-seg (COCO)
+ultralytics>=8.4.0    # YOLOE (open vocabulary) and yolo26-seg (COCO)
+# On Windows/Linux with an NVIDIA GPU, install CUDA-enabled PyTorch wheels first if pip
+# defaults to CPU-only wheels (e.g. pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128)
 torch
 torchvision           # not imported here, but ultralytics needs it and it must match
                       # torch's CUDA build — pinned explicitly so pip cannot drift
@@ -16,8 +18,8 @@ opencv-python
 pillow>=11.0.0        # because of torchvision
 
 # Optional: lets the loader pick a TensorRT .engine over .onnx/.pt when one exists
-# next to the model (see get_yolo_model's format priority).
-tensorrt
+# next to the model (see get_yolo_model's format priority). Uncomment if TensorRT is needed.
+# tensorrt
 
 # Optional: only for the legacy opt-in RF-DETR detector (--model rfdetr)
 # inference
