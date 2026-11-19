@@ -50,12 +50,20 @@ namespace Networking
     {
         private const string DetectorPref = "PromptedVision.Detector";
         private const uint VocabularyAckFrameId = 0xFFFFFFFEu;
+        private const int InFlightRingSize = 16; // power of two
+
+        private struct SentFrameRecord
+        {
+            public uint frameId;
+            public int generation;
+            public long sendTicks;
+        }
 
         [Header("Detection Settings")]
         [SerializeField] private float scoreThreshold = 0.25f;
         [SerializeField] private MaskFormat maskFormat = MaskFormat.Polygon;
         [SerializeField] private bool requestSegmentationMasks = true;
-        [SerializeField] [Range(64, 1024)] private int maskResolution = 512;
+        [SerializeField] [Range(64, 1024)] private int maskResolution = 256;
         [SerializeField] [Range(16, 256)] private int maxPolygonPoints = 64;
 
         [Tooltip("Seconds to wait for a response before the next frame is sent anyway (lost packet).")]
@@ -76,21 +84,22 @@ namespace Networking
 
         // Handed over from the UDP receive thread to the main thread.
         private readonly object lockObj = new();
+        private readonly SentFrameRecord[] sentFrames = new SentFrameRecord[InFlightRingSize];
+        private readonly byte[] frameMetaBuffer = new byte[10];
+        private readonly List<Texture> ownedMaskTextures = new();
         private List<DetectedObject> pendingDetections;
         private bool hasUpdate;
+        private uint lastAcceptedFrameId;
 
         private volatile bool waitingForResponse;
         private float lastFrameTime;
 
         // A label_id is a slot of the vocabulary the frame was detected under. Results of a frame
         // sent before the last vocabulary change would light up the new shader's slots with the
-        // old shader's objects, so they are dropped.
+        // old shader's objects, so each sent frame records its vocabularyGeneration and responses
+        // from older generations are dropped.
         private volatile int vocabularyGeneration;
-        private volatile int sentFrameGeneration;
         private volatile bool vocabularyAckLogged;
-
-        // Stopwatch ticks of the in-flight frame's send, for the latency benchmark's RTT.
-        private long sendTimestampTicks;
 
         // Active shader's class list: label_id is the slot index into it. Assigned on the main
         // thread, read on the UDP thread; swapped by reference.
@@ -123,6 +132,13 @@ namespace Networking
             {
                 gpuRasterizer ??= new GPUPolygonRasterizer(polygonRasterizerShader, maxPolygonPoints);
 
+                lock (lockObj)
+                {
+                    Array.Clear(sentFrames, 0, sentFrames.Length);
+                    lastAcceptedFrameId = 0;
+                }
+                waitingForResponse = false;
+
                 udpTransmitter = new UdpImageTransmitter();
                 udpTransmitter.OnDataReceived += HandleUdpResponse;
                 udpTransmitter.OnError += msg => logger?.LogWarning($"UDP: {msg}", nameof(DetectionNetworkClient));
@@ -147,6 +163,7 @@ namespace Networking
             udpTransmitter?.Dispose();
             udpTransmitter = null;
 
+            ReleaseOwnedMaskTextures(destroyAll: true);
             gpuRasterizer?.Dispose();
             gpuRasterizer = null;
         }
@@ -157,15 +174,18 @@ namespace Networking
         {
             while (true)
             {
-                bool canSend = !waitingForResponse || Time.time - lastFrameTime >= responseTimeout;
-                if (canSend && screenshotProvider != null && udpTransmitter != null && udpTransmitter.IsConnected)
+                bool responseReadyOrTimedOut = !waitingForResponse || Time.time - lastFrameTime >= responseTimeout;
+                // Check CanSendFrame BEFORE capturing and JPEG-encoding: previously, when server
+                // RTT was faster than MinSendInterval (33 ms), SendFrame silently dropped the frame
+                // while StreamingLoop set waitingForResponse = true, stalling for responseTimeout (1s).
+                if (responseReadyOrTimedOut && screenshotProvider != null
+                    && udpTransmitter != null && udpTransmitter.CanSendFrame)
                 {
                     bool captured = false;
                     screenshotProvider.CaptureStreamingScreenshot(tex =>
                     {
-                        if (tex != null)
+                        if (tex != null && udpTransmitter != null && SendUdpFrame(tex))
                         {
-                            SendUdpFrame(tex);
                             waitingForResponse = true;
                             lastFrameTime = Time.time;
                         }
@@ -210,14 +230,14 @@ namespace Networking
 
             vocabulary = lastVocabulary.Count > 0 ? lastVocabulary.ToArray() : null;
 
-            if (confidence >= 0f)
+            if (confidence > 0f)
             {
                 scoreThreshold = confidence;
             }
 
-            vocabularyGeneration++;
             lock (lockObj)
             {
+                vocabularyGeneration++;
                 pendingDetections = new List<DetectedObject>();
                 hasUpdate = true;
             }
@@ -289,6 +309,10 @@ namespace Networking
             }
             if (dets == null) return;
 
+            // Return previous frame's mask RenderTextures to the pool before rasterizing the new
+            // frame so pooled RenderTextures are immediately reused instead of leaking VRAM.
+            ReleaseOwnedMaskTextures(destroyAll: false);
+
             if (gpuRasterizer != null && requestSegmentationMasks)
             {
                 for (int i = 0; i < dets.Count; i++)
@@ -298,6 +322,10 @@ namespace Networking
                     {
                         det.MaskTexture = gpuRasterizer.RasterizePolygon(det.MaskPolygon, maskResolution);
                         det.HasMask = det.MaskTexture != null;
+                        if (det.MaskTexture != null)
+                        {
+                            ownedMaskTextures.Add(det.MaskTexture);
+                        }
                         dets[i] = det;
                     }
                 }
@@ -316,22 +344,55 @@ namespace Networking
             OnDetectionsUpdated?.Invoke(CurrentDetections);
         }
 
-        private void SendUdpFrame(Texture2D frame)
+        private void ReleaseOwnedMaskTextures(bool destroyAll)
+        {
+            for (int i = 0; i < ownedMaskTextures.Count; i++)
+            {
+                var tex = ownedMaskTextures[i];
+                if (tex == null) continue;
+
+                if (!destroyAll && gpuRasterizer != null && tex is RenderTexture rt)
+                {
+                    gpuRasterizer.ReturnToPool(rt);
+                }
+                else
+                {
+                    if (tex is RenderTexture deadRt) deadRt.Release();
+                    Destroy(tex);
+                }
+            }
+            ownedMaskTextures.Clear();
+        }
+
+        private bool SendUdpFrame(Texture2D frame)
         {
             byte[] jpg = frame.EncodeToJPG(75);
 
             // [score:4][maskFormat:1][requestMasks:1][maskRes:2][maxPoints:2]
-            byte[] meta = new byte[10];
-            int offset = 0;
-            Buffer.BlockCopy(BitConverter.GetBytes(scoreThreshold), 0, meta, offset, 4); offset += 4;
-            meta[offset++] = (byte)maskFormat;
-            meta[offset++] = (byte)(requestSegmentationMasks ? 1 : 0);
-            Buffer.BlockCopy(BitConverter.GetBytes((ushort)maskResolution), 0, meta, offset, 2); offset += 2;
-            Buffer.BlockCopy(BitConverter.GetBytes((ushort)maxPolygonPoints), 0, meta, offset, 2);
+            WriteSingleLE(frameMetaBuffer, 0, scoreThreshold);
+            frameMetaBuffer[4] = (byte)maskFormat;
+            frameMetaBuffer[5] = (byte)(requestSegmentationMasks ? 1 : 0);
+            WriteUInt16LE(frameMetaBuffer, 6, (ushort)maskResolution);
+            WriteUInt16LE(frameMetaBuffer, 8, (ushort)maxPolygonPoints);
 
-            sendTimestampTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            sentFrameGeneration = vocabularyGeneration;
-            udpTransmitter.SendFrame(jpg, meta);
+            long sendTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            int gen = vocabularyGeneration;
+
+            if (!udpTransmitter.TrySendFrame(jpg, frameMetaBuffer, out uint sentFrameId))
+            {
+                return false;
+            }
+
+            lock (lockObj)
+            {
+                sentFrames[sentFrameId & (InFlightRingSize - 1)] = new SentFrameRecord
+                {
+                    frameId = sentFrameId,
+                    generation = gen,
+                    sendTicks = sendTicks
+                };
+            }
+            return true;
         }
 
         /// <summary>
@@ -339,11 +400,13 @@ namespace Networking
         /// </summary>
         private void HandleUdpResponse(byte[] data)
         {
-            waitingForResponse = false;
+            if (data == null || data.Length < 4) return;
 
-            if (data.Length >= 4 && BitConverter.ToUInt32(data, 0) == VocabularyAckFrameId)
+            uint responseFrameId = BitConverter.ToUInt32(data, 0);
+
+            // Control acks must NOT clear waitingForResponse for an in-flight detection frame.
+            if (responseFrameId == VocabularyAckFrameId)
             {
-                // The packet goes out three times; one ack line says it arrived.
                 if (vocabularyAckLogged) return;
                 vocabularyAckLogged = true;
                 string ackJson = data.Length > 4 ? System.Text.Encoding.UTF8.GetString(data, 4, data.Length - 4) : "";
@@ -351,10 +414,36 @@ namespace Networking
                 return;
             }
 
-            if (sentFrameGeneration != vocabularyGeneration) return;
-
             // Header: [frame_id:4][num_detections:2]
             if (data.Length < 6) return;
+
+            long matchedSendTicks = 0;
+            lock (lockObj)
+            {
+                var record = sentFrames[responseFrameId & (InFlightRingSize - 1)];
+                bool matchesInFlight = record.frameId == responseFrameId;
+
+                // Only clear waitingForResponse when this response is at least as recent as the
+                // latest accepted frame (protects against delayed duplicates from timed-out frames).
+                if (lastAcceptedFrameId == 0 || (int)(responseFrameId - lastAcceptedFrameId) > 0)
+                {
+                    waitingForResponse = false;
+                }
+                else
+                {
+                    return; // Out-of-order or duplicate packet from an older frame
+                }
+
+                // Drop frames sent under a previous shader's vocabulary so old object slots never
+                // light up the newly applied shader.
+                if (!matchesInFlight || record.generation != vocabularyGeneration)
+                {
+                    return;
+                }
+
+                lastAcceptedFrameId = responseFrameId;
+                matchedSendTicks = record.sendTicks;
+            }
 
             int offset = 4;
             ushort numDetections = BitConverter.ToUInt16(data, offset); offset += 2;
@@ -401,13 +490,17 @@ namespace Networking
 
             lock (lockObj)
             {
+                if (vocabularyGeneration != sentFrames[responseFrameId & (InFlightRingSize - 1)].generation)
+                {
+                    return;
+                }
                 pendingDetections = detections;
                 hasUpdate = true;
             }
 
-            if (sendTimestampTicks != 0 && DetectionLatencyBenchmark.Instance != null)
+            if (matchedSendTicks != 0 && DetectionLatencyBenchmark.Instance != null)
             {
-                float rttMs = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - sendTimestampTicks)
+                float rttMs = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - matchedSendTicks)
                                       * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                 DetectionLatencyBenchmark.Instance.Record(rttMs, detections);
             }
@@ -417,6 +510,21 @@ namespace Networking
         {
             var vocab = vocabulary;
             return vocab != null && labelId < vocab.Length ? vocab[labelId] : $"Item {labelId}";
+        }
+
+        private static void WriteSingleLE(byte[] buffer, int offset, float value)
+        {
+            int bits = BitConverter.SingleToInt32Bits(value);
+            buffer[offset] = (byte)bits;
+            buffer[offset + 1] = (byte)(bits >> 8);
+            buffer[offset + 2] = (byte)(bits >> 16);
+            buffer[offset + 3] = (byte)(bits >> 24);
+        }
+
+        private static void WriteUInt16LE(byte[] buffer, int offset, ushort value)
+        {
+            buffer[offset] = (byte)value;
+            buffer[offset + 1] = (byte)(value >> 8);
         }
     }
 }

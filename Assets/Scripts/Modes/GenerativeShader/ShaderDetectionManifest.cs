@@ -17,6 +17,7 @@ using UnityEngine;
 public class ShaderDetectionManifest
 {
     private const string FileName = "detection_classes.json";
+    private const float DefaultConfidence = 0.25f;
 
     /// <summary>
     /// Natural-language target classes, in slot order. Slot index = shader labelID.
@@ -87,8 +88,28 @@ public class ShaderDetectionManifest
 
         try
         {
-            manifest = JsonUtility.FromJson<ShaderDetectionManifest>(File.ReadAllText(path));
-            return manifest != null;
+            string json = File.ReadAllText(path);
+            manifest = JsonUtility.FromJson<ShaderDetectionManifest>(json);
+            if (manifest == null)
+            {
+                return false;
+            }
+
+            manifest.classes ??= new List<string>();
+            manifest.cocoClasses ??= new List<string>();
+
+            // JsonUtility bypasses C# field initializers and writes 0f when "confidence" is absent
+            // from the JSON, which would otherwise push scoreThreshold = 0 to the detector.
+            if (!json.Contains("\"confidence\"") || manifest.confidence <= 0f)
+            {
+                manifest.confidence = DefaultConfidence;
+            }
+            else
+            {
+                manifest.confidence = Mathf.Clamp01(manifest.confidence);
+            }
+
+            return true;
         }
         catch (Exception)
         {
