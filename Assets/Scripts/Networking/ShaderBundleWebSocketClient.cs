@@ -78,7 +78,14 @@ namespace Networking
                 await SendShaderFile(ws, shaderPath, timeout.Token);
                 await ReceiveBundle(ws, session, timeout.Token);
 
-                await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", timeout.Token);
+                if (ws.State == WebSocketState.Open)
+                {
+                    await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Done", timeout.Token);
+                }
+                else if (ws.State == WebSocketState.CloseReceived)
+                {
+                    await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Done", timeout.Token);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -96,7 +103,7 @@ namespace Networking
             var nameBytes = Encoding.UTF8.GetBytes(Path.GetFileName(shaderPath));
             await ws.SendAsync(new ArraySegment<byte>(nameBytes), WebSocketMessageType.Text, true, token);
 
-            byte[] shaderBytes = File.ReadAllBytes(shaderPath);
+            byte[] shaderBytes = await File.ReadAllBytesAsync(shaderPath, token);
             await ws.SendAsync(new ArraySegment<byte>(shaderBytes), WebSocketMessageType.Binary, true, token);
 
             logger?.LogInfo($"Shader file sent: {shaderPath}", nameof(ShaderBundleWebSocketClient));

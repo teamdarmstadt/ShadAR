@@ -50,6 +50,7 @@ public class ClaudeConversationManager : MonoBehaviour
     private string stateFilePath;
     private string persistentSystemPromptPath;
     private string cachedSystemPrompt;
+    private DateTime cachedPromptWriteTimeUtc;
 
     /// <summary>
     /// Singleton instance of the conversation manager.
@@ -60,6 +61,28 @@ public class ClaudeConversationManager : MonoBehaviour
     /// Gets whether conversation mode is enabled.
     /// </summary>
     public bool IsConversationModeActive => enableConversationMode;
+
+    /// <summary>
+    /// True when any assistant shader in the active conversation declared @detect-classes, so
+    /// follow-up edits ("make it more blue") keep the object-detection rules in the system prompt.
+    /// </summary>
+    public bool HasDetectionContext
+    {
+        get
+        {
+            if (state?.messages == null) return false;
+            for (int i = state.messages.Count - 1; i >= 0; i--)
+            {
+                var msg = state.messages[i];
+                if (msg != null && msg.role == "assistant" && !string.IsNullOrEmpty(msg.content)
+                    && msg.content.IndexOf("@detect-classes:", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
 
     private void Awake()
     {
@@ -137,7 +160,8 @@ public class ClaudeConversationManager : MonoBehaviour
     /// </summary>
     public async Task<string> GetSystemPromptAsync()
     {
-        if (!string.IsNullOrWhiteSpace(cachedSystemPrompt))
+        if (!string.IsNullOrWhiteSpace(cachedSystemPrompt) && File.Exists(persistentSystemPromptPath)
+            && File.GetLastWriteTimeUtc(persistentSystemPromptPath) == cachedPromptWriteTimeUtc)
         {
             return cachedSystemPrompt;
         }
@@ -181,6 +205,7 @@ public class ClaudeConversationManager : MonoBehaviour
             content += "- If starting fresh (no reference to previous), create a new shader from scratch\n";
 
             cachedSystemPrompt = content;
+            cachedPromptWriteTimeUtc = File.GetLastWriteTimeUtc(persistentSystemPromptPath);
             return cachedSystemPrompt;
         }
         catch (Exception ex)

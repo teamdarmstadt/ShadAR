@@ -13,6 +13,8 @@ public class WhisperTranscriber : MonoBehaviour
 {
     private const int DefaultSampleRate = 44100;
     private const int DefaultMaxRecordingLength = 60;
+    private const float MinRecordingSeconds = 0.15f;
+    private const float NormalizationNoiseFloor = 0.01f;
 
     [Header("OpenAI Configuration")]
     [Tooltip("Reference to the OpenAI Config Manager (optional - will use singleton if not set)")]
@@ -50,7 +52,16 @@ public class WhisperTranscriber : MonoBehaviour
 
     private void Awake() => tooltip = ControllerTooltips.Register(triggerButton, "Hold to speak");
 
-    private void OnDestroy() => ControllerTooltips.Unregister(tooltip);
+    private void OnDestroy()
+    {
+        ControllerTooltips.Unregister(tooltip);
+        if (recording && !string.IsNullOrEmpty(micDevice))
+        {
+            Microphone.End(micDevice);
+            recording = false;
+        }
+        DestroyAudioClip();
+    }
 
     private void Update()
     {
@@ -68,6 +79,16 @@ public class WhisperTranscriber : MonoBehaviour
     {
         if (recording) return;
 
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(UnityEngine.Android.Permission.Microphone))
+        {
+            UnityEngine.Android.Permission.RequestUserPermission(UnityEngine.Android.Permission.Microphone);
+            logger?.LogWarning("Microphone permission requested — grant it and hold B again.", nameof(WhisperTranscriber));
+            logger?.SetStatus("Grant microphone permission, then hold B to speak.");
+            return;
+        }
+#endif
+
         micDevice = Microphone.devices.Length > 0 ? Microphone.devices[0] : null;
         if (micDevice == null)
         {
@@ -75,7 +96,14 @@ public class WhisperTranscriber : MonoBehaviour
             return;
         }
 
+        DestroyAudioClip();
         audioClip = Microphone.Start(micDevice, false, maxLengthSec, sampleRate);
+        if (audioClip == null)
+        {
+            logger?.LogError("Failed to start microphone recording.", nameof(WhisperTranscriber));
+            return;
+        }
+
         recording = true;
         logger?.LogInfo("Recording...", nameof(WhisperTranscriber));
         logger?.SetStatus("Listening...", busy: true);
@@ -85,39 +113,37 @@ public class WhisperTranscriber : MonoBehaviour
     {
         if (!recording || audioClip == null)
         {
-            logger?.LogWarning("No recording in progress.", nameof(WhisperTranscriber));
             return;
         }
 
-        PipelineBenchmarkLogger.Instance?.BeginSession();
-        PipelineBenchmarkLogger.Instance?.RecordTimestamp("speech_complete");
-
+        // Check whether the non-looping clip was still recording before Microphone.End():
+        // if it was still recording and micPos == 0 (quick tap), 0 samples were captured — NOT
+        // the full 60s buffer! Only when recording stopped on its own did it hit maxLengthSec.
+        bool wasStillRecording = Microphone.IsRecording(micDevice);
         int micPos = Microphone.GetPosition(micDevice);
         Microphone.End(micDevice);
         recording = false;
-        logger?.SetStatus("Transcribing...", busy: true);
-        Transcribe(micPos);
-    }
 
-    private async void Transcribe(int micPos)
-    {
         int channels = audioClip.channels;
         int frequency = audioClip.frequency;
         int totalSamples = audioClip.samples;
-        int usedSamples = (micPos > 0 && micPos <= totalSamples) ? micPos : totalSamples;
+        int usedSamples = wasStillRecording
+            ? Mathf.Clamp(micPos, 0, totalSamples)
+            : (micPos > 0 && micPos <= totalSamples ? micPos : totalSamples);
+
+        int minSamples = Mathf.Max(1, Mathf.RoundToInt(frequency * MinRecordingSeconds));
+        if (usedSamples < minSamples)
+        {
+            DestroyAudioClip();
+            logger?.LogInfo("Recording too short — hold B while speaking.", nameof(WhisperTranscriber));
+            logger?.SetStatus("Hold B while speaking.");
+            return;
+        }
 
         float[] samples = new float[usedSamples * channels];
         audioClip.GetData(samples, 0);
-
-        if (normalizeAudio)
-        {
-            Normalize(samples);
-        }
-
-        // Unique name per recording: with a fixed name, a new recording truncated the file
-        // while the previous upload was still reading it, which corrupted that transcript.
-        string wavPath = Path.Combine(Application.temporaryCachePath, $"voice_{DateTime.UtcNow.Ticks}.wav");
-        WriteWavFile(wavPath, samples, usedSamples, channels, frequency);
+        // Free the 60s native PCM AudioClip buffer (~10.6 MB) immediately after reading samples.
+        DestroyAudioClip();
 
         var configManager = openAIConfigManager != null ? openAIConfigManager : OpenAIConfigManager.Instance;
         if (configManager == null || !configManager.IsInitialized || configManager.Client == null)
@@ -128,13 +154,47 @@ public class WhisperTranscriber : MonoBehaviour
             return;
         }
 
+        PipelineBenchmarkLogger.Instance?.BeginSession();
+        PipelineBenchmarkLogger.Instance?.RecordTimestamp("speech_complete");
+        logger?.SetStatus("Transcribing...", busy: true);
+
+        TranscribeAsync(samples, usedSamples, channels, frequency, configManager);
+    }
+
+    private void DestroyAudioClip()
+    {
+        if (audioClip != null)
+        {
+            Destroy(audioClip);
+            audioClip = null;
+        }
+    }
+
+    private async void TranscribeAsync(
+        float[] samples,
+        int usedSamples,
+        int channels,
+        int frequency,
+        OpenAIConfigManager configManager)
+    {
+        string wavPath = Path.Combine(Application.temporaryCachePath, $"voice_{DateTime.UtcNow.Ticks}.wav");
+        bool doNormalize = normalizeAudio;
+
         try
         {
+            // Normalize and encode WAV off the main thread to avoid VR frame hitches on long prompts.
+            await Task.Run(() =>
+            {
+                if (doNormalize)
+                {
+                    Normalize(samples);
+                }
+                WriteWavFile(wavPath, samples, usedSamples, channels, frequency);
+            });
+
             var request = new AudioTranscriptionRequest(Path.GetFullPath(wavPath), language: "en");
             PipelineBenchmarkLogger.Instance?.RecordTimestamp("audio_sent_to_whisper");
 
-            // Same reason as in LLMShaderGenerator: without a deadline a request on a dead
-            // connection never returns, and the prompt silently disappears.
             var transcription = configManager.Client.AudioEndpoint.CreateTranscriptionTextAsync(request);
             if (await Task.WhenAny(transcription, Task.Delay(TimeSpan.FromSeconds(requestTimeoutSeconds))) != transcription)
             {
@@ -158,7 +218,14 @@ public class WhisperTranscriber : MonoBehaviour
         }
         finally
         {
-            try { File.Delete(wavPath); } catch (IOException) { /* cache cleanup is best-effort */ }
+            try
+            {
+                if (File.Exists(wavPath)) File.Delete(wavPath);
+            }
+            catch (IOException)
+            {
+                // Cache cleanup is best-effort
+            }
         }
     }
 
@@ -167,10 +234,12 @@ public class WhisperTranscriber : MonoBehaviour
         float max = 0f;
         for (int i = 0; i < samples.Length; i++)
         {
-            max = Mathf.Max(max, Mathf.Abs(samples[i]));
+            float abs = Math.Abs(samples[i]);
+            if (abs > max) max = abs;
         }
 
-        if (max > 0f && max < 0.99f)
+        // Ignore near-zero background hiss so silent recordings are not boosted into full-scale noise.
+        if (max > NormalizationNoiseFloor && max < 0.99f)
         {
             float gain = 1f / max;
             for (int i = 0; i < samples.Length; i++)
@@ -182,30 +251,49 @@ public class WhisperTranscriber : MonoBehaviour
 
     private static void WriteWavFile(string filePath, float[] samples, int sampleCount, int channels, int frequency)
     {
-        using var fileStream = new FileStream(filePath, FileMode.Create);
-        using var writer = new BinaryWriter(fileStream);
-
         int byteRate = frequency * channels * 2;
         int dataSize = sampleCount * channels * 2;
+        byte[] wavBytes = new byte[44 + dataSize];
 
-        // RIFF header, 16-bit PCM
-        writer.Write(Encoding.UTF8.GetBytes("RIFF"));
-        writer.Write(36 + dataSize);
-        writer.Write(Encoding.UTF8.GetBytes("WAVE"));
-        writer.Write(Encoding.UTF8.GetBytes("fmt "));
-        writer.Write(16);
-        writer.Write((short)1);
-        writer.Write((short)channels);
-        writer.Write(frequency);
-        writer.Write(byteRate);
-        writer.Write((short)(channels * 2));
-        writer.Write((short)16);
-        writer.Write(Encoding.UTF8.GetBytes("data"));
-        writer.Write(dataSize);
+        // RIFF header, 16-bit little-endian PCM
+        Encoding.ASCII.GetBytes("RIFF", 0, 4, wavBytes, 0);
+        WriteInt32LE(wavBytes, 4, 36 + dataSize);
+        Encoding.ASCII.GetBytes("WAVE", 0, 4, wavBytes, 8);
+        Encoding.ASCII.GetBytes("fmt ", 0, 4, wavBytes, 12);
+        WriteInt32LE(wavBytes, 16, 16);
+        WriteInt16LE(wavBytes, 20, 1);
+        WriteInt16LE(wavBytes, 22, (short)channels);
+        WriteInt32LE(wavBytes, 24, frequency);
+        WriteInt32LE(wavBytes, 28, byteRate);
+        WriteInt16LE(wavBytes, 32, (short)(channels * 2));
+        WriteInt16LE(wavBytes, 34, 16);
+        Encoding.ASCII.GetBytes("data", 0, 4, wavBytes, 36);
+        WriteInt32LE(wavBytes, 40, dataSize);
 
-        for (int i = 0; i < samples.Length; i++)
+        int byteOffset = 44;
+        int totalValues = Math.Min(samples.Length, sampleCount * channels);
+        for (int i = 0; i < totalValues; i++)
         {
-            writer.Write((short)Mathf.Clamp(samples[i] * 32767f, -32768f, 32767f));
+            float scaled = samples[i] * 32767f;
+            short pcm = scaled >= 32767f ? (short)32767 : scaled <= -32768f ? (short)-32768 : (short)scaled;
+            wavBytes[byteOffset++] = (byte)pcm;
+            wavBytes[byteOffset++] = (byte)(pcm >> 8);
         }
+
+        File.WriteAllBytes(filePath, wavBytes);
+    }
+
+    private static void WriteInt32LE(byte[] buf, int offset, int value)
+    {
+        buf[offset] = (byte)value;
+        buf[offset + 1] = (byte)(value >> 8);
+        buf[offset + 2] = (byte)(value >> 16);
+        buf[offset + 3] = (byte)(value >> 24);
+    }
+
+    private static void WriteInt16LE(byte[] buf, int offset, short value)
+    {
+        buf[offset] = (byte)value;
+        buf[offset + 1] = (byte)(value >> 8);
     }
 }

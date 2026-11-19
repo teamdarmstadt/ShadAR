@@ -190,6 +190,7 @@ public class LLMShaderGenerator : MonoBehaviour
 
     private string persistentPromptPath;
     private string persistentObjectDetectionPromptPath;
+    private Task promptInitializationTask = Task.CompletedTask;
     private readonly Dictionary<string, bool> intentCache = new Dictionary<string, bool>();
     private readonly Queue<string> intentCacheOrder = new Queue<string>();
 
@@ -441,9 +442,7 @@ public class LLMShaderGenerator : MonoBehaviour
 
         if (claudeConversationManager == null)
         {
-            logger?.LogWarning("ClaudeConversationManager not found. Conversation mode will be disabled.", nameof(LLMShaderGenerator));
-            logger?.LogWarning("Add ClaudeConversationManager component to the scene to enable conversation mode.", nameof(LLMShaderGenerator));
-            useConversationMode = false;
+            logger?.LogWarning("ClaudeConversationManager not found. Claude conversation history will be disabled.", nameof(LLMShaderGenerator));
         }
         else
         {
@@ -470,9 +469,7 @@ public class LLMShaderGenerator : MonoBehaviour
         
         if (conversationManager == null)
         {
-            logger?.LogWarning("OpenAIConversationManager not found. Conversation mode will be disabled.", nameof(LLMShaderGenerator));
-            logger?.LogWarning("Add OpenAIConversationManager component to the scene to enable conversation mode.", nameof(LLMShaderGenerator));
-            useConversationMode = false;
+            logger?.LogWarning("OpenAIConversationManager not found. OpenAI conversation history will be disabled.", nameof(LLMShaderGenerator));
         }
         else
         {
@@ -489,11 +486,13 @@ public class LLMShaderGenerator : MonoBehaviour
         persistentObjectDetectionPromptPath = Path.Combine(Application.persistentDataPath, objectDetectionPromptFilePath);
 
 #if UNITY_ANDROID && !UNITY_EDITOR
-        EnsurePromptCopiedAndroid(promptFilePath, persistentPromptPath);
-        EnsurePromptCopiedAndroid(objectDetectionPromptFilePath, persistentObjectDetectionPromptPath);
+        promptInitializationTask = Task.WhenAll(
+            EnsurePromptCopiedAndroid(promptFilePath, persistentPromptPath),
+            EnsurePromptCopiedAndroid(objectDetectionPromptFilePath, persistentObjectDetectionPromptPath));
 #else
         EnsurePromptCopied(promptFilePath, persistentPromptPath);
         EnsurePromptCopied(objectDetectionPromptFilePath, persistentObjectDetectionPromptPath);
+        promptInitializationTask = Task.CompletedTask;
 #endif
     }
 
@@ -563,40 +562,48 @@ public class LLMShaderGenerator : MonoBehaviour
     }
 
 #if UNITY_ANDROID && !UNITY_EDITOR
-    private void EnsurePromptCopiedAndroid(string promptPath, string persistentPath)
+    private Task EnsurePromptCopiedAndroid(string promptPath, string persistentPath)
     {
         // Unlike the desktop path this cannot short-circuit on File.Exists: inside the APK the
         // shipped prompt is only readable through UnityWebRequest, so it must be fetched before
         // its hash can be compared. It is a few KB once per launch.
+        var tcs = new TaskCompletionSource<bool>();
         string sourcePath = Path.Combine(Application.streamingAssetsPath, promptPath);
-        StartCoroutine(CopyPromptFromStreamingAssetsAndroid(sourcePath, persistentPath));
+        StartCoroutine(CopyPromptFromStreamingAssetsAndroid(sourcePath, persistentPath, tcs));
+        return tcs.Task;
     }
-#endif
 
-#if UNITY_ANDROID && !UNITY_EDITOR
     /// <summary>
     /// Copies prompt file from StreamingAssets on Android using UnityWebRequest.
     /// </summary>
-    private System.Collections.IEnumerator CopyPromptFromStreamingAssetsAndroid(string sourcePath, string destPath)
+    private System.Collections.IEnumerator CopyPromptFromStreamingAssetsAndroid(
+        string sourcePath, string destPath, TaskCompletionSource<bool> completion)
     {
-        string uri = sourcePath;
-        if (!uri.StartsWith("jar:") && !uri.StartsWith("file://"))
+        try
         {
-            uri = "file://" + uri;
+            string uri = sourcePath;
+            if (!uri.StartsWith("jar:") && !uri.StartsWith("file://"))
+            {
+                uri = "file://" + uri;
+            }
+
+            using (var www = UnityEngine.Networking.UnityWebRequest.Get(uri))
+            {
+                yield return www.SendWebRequest();
+
+                if (www.result == UnityEngine.Networking.UnityWebRequest.Result.Success)
+                {
+                    WritePromptIfShippedVersionChanged(www.downloadHandler.text, destPath);
+                }
+                else
+                {
+                    logger?.LogError($"Failed to copy prompt file on Android: {uri}", nameof(LLMShaderGenerator));
+                }
+            }
         }
-        
-        using (var www = UnityEngine.Networking.UnityWebRequest.Get(uri))
+        finally
         {
-            yield return www.SendWebRequest();
-            
-            if (www.result == UnityEngine.Networking.UnityWebRequest.Result.Success)
-            {
-                WritePromptIfShippedVersionChanged(www.downloadHandler.text, destPath);
-            }
-            else
-            {
-                logger?.LogError($"Failed to copy prompt file on Android: {uri}", nameof(LLMShaderGenerator));
-            }
+            completion.TrySetResult(true);
         }
     }
 #endif
@@ -612,6 +619,11 @@ public class LLMShaderGenerator : MonoBehaviour
 
         try
         {
+            if (promptInitializationTask != null)
+            {
+                await promptInitializationTask;
+            }
+
             string shaderCode = null;
 
             switch (Provider)
@@ -709,46 +721,64 @@ public class LLMShaderGenerator : MonoBehaviour
         PipelineBenchmarkLogger.Instance?.SetReasoningEffort(
             configManager.ReasoningEffort ?? reasoningEffort.ToString().ToLowerInvariant());
 
-        bool includeObjectDetectionPrompt = await ShouldIncludeObjectDetectionPromptAsync(transcription);
+        bool conversationEnabled = useConversationMode
+            && (conversationManager ??= OpenAIConversationManager.Instance) != null
+            && conversationManager.IsConversationEnabled;
+        bool priorDetectionContext = conversationEnabled && conversationManager.HasDetectionContext;
+        bool includeObjectDetectionPrompt = await ShouldIncludeObjectDetectionPromptAsync(transcription) || priorDetectionContext;
 
-        // Try to use Conversations API if enabled
-        if (!includeObjectDetectionPrompt && useConversationMode && conversationManager != null && conversationManager.IsConversationModeActive)
+        // Keep ALL turns (including object-detection shaders) in the same conversation by supplying
+        // per-response instructions, so follow-up prompts ("make it more blue") see the prior shader.
+        if (conversationEnabled)
         {
-            return await GenerateWithConversationAPI(client, transcription, model);
+            return await GenerateWithConversationAPI(client, transcription, model, includeObjectDetectionPrompt);
         }
 
-        if (includeObjectDetectionPrompt && useConversationMode && conversationManager != null && conversationManager.IsConversationModeActive)
-        {
-            logger?.LogDebug("Object detection prompt requested. Using Chat API to apply expanded system prompt.", nameof(LLMShaderGenerator));
-        }
-
-        // Fallback to Chat API
+        // Fallback to stateless Chat API when conversation mode is disabled
         return await GenerateWithChatAPI(client, transcription, model, includeObjectDetectionPrompt);
     }
 
     /// <summary>
-    /// Generates shader using the Conversations API (maintains context).
+    /// Generates shader using the Conversations / Responses API (maintains multi-turn context).
     /// </summary>
-    private async Task<string> GenerateWithConversationAPI(OpenAIClient client, string transcription, string model)
+    private async Task<string> GenerateWithConversationAPI(
+        OpenAIClient client,
+        string transcription,
+        string model,
+        bool includeObjectDetectionPrompt)
     {
         logger?.LogInfo($"Using Conversations API with model: {model}", nameof(LLMShaderGenerator));
 
-        var conversation = conversationManager.GetConversation();
-
+        var conversation = await conversationManager.EnsureConversationAsync();
         if (conversation == null)
         {
-            logger?.LogError("Conversation is null. Falling back to Chat API.", nameof(LLMShaderGenerator));
-            return await GenerateWithChatAPI(client, transcription, model);
+            logger?.LogWarning("Conversation unavailable. Falling back to Chat API.", nameof(LLMShaderGenerator));
+            return await GenerateWithChatAPI(client, transcription, model, includeObjectDetectionPrompt);
         }
 
         string conversationId = conversationManager.GetConversationId();
+        string instructions = await conversationManager.GetSystemPromptAsync();
+        if (string.IsNullOrWhiteSpace(instructions))
+        {
+            instructions = BuildSystemPrompt(includeObjectDetectionPrompt: false);
+        }
+        if (includeObjectDetectionPrompt && !string.IsNullOrWhiteSpace(instructions))
+        {
+            string detectionPrompt = ReadObjectDetectionPrompt();
+            if (!string.IsNullOrWhiteSpace(detectionPrompt))
+            {
+                instructions = $"{instructions}\n\n{detectionPrompt}";
+            }
+        }
 
         try
         {
             // The Responses API appends this input (and the answer) to the conversation itself;
-            // adding the user message separately first would store every prompt twice.
+            // passing instructions overrides developer instructions for this turn so object-detection
+            // rules and updated shipped prompts apply without dropping conversation history.
             var request = new CreateResponseRequest(
                 textInput: transcription,
+                instructions: instructions,
                 conversationId: conversationId,
                 model: model,
                 reasoning: ToReasoning(GetReasoningEffort())
@@ -757,30 +787,36 @@ public class LLMShaderGenerator : MonoBehaviour
             var response = await WithTimeout(
                 client.ResponsesEndpoint.CreateModelResponseAsync(request), requestTimeoutSeconds, "OpenAI");
 
+            if (response != null && response.Status == ResponseStatus.Incomplete)
+            {
+                logger?.LogError("OpenAI stopped before finishing the response — the shader is cut off.", nameof(LLMShaderGenerator));
+                return null;
+            }
+
             if (response?.Output != null)
             {
-                var responseItem = response.Output.LastOrDefault();
-                
-                if (responseItem != null)
+                string content = !string.IsNullOrWhiteSpace(response.OutputText)
+                    ? response.OutputText
+                    : response.Output.LastOrDefault()?.ToString();
+
+                if (!string.IsNullOrWhiteSpace(content))
                 {
                     logger?.LogDebug($"Received response from conversation {conversationId}", nameof(LLMShaderGenerator));
-                    
-                    // Update message count
-                    conversationManager.IncrementMessageCount();
-                    
-                    string content = responseItem.ToString();
-                    return ExtractShaderCode(content);
+                    string extracted = ExtractShaderCode(content);
+                    bool hasDetectionHeader = !string.IsNullOrEmpty(extracted) && TryParseDetectionManifest(extracted, out _);
+                    conversationManager.RecordTurn(includeObjectDetectionPrompt || hasDetectionHeader);
+                    return extracted;
                 }
             }
         }
         catch (Exception ex) when (ex is not TimeoutException)
         {
             logger?.LogWarning($"Conversations API error: {ex.Message}. Falling back to Chat API.", nameof(LLMShaderGenerator));
-            return await GenerateWithChatAPI(client, transcription, model);
+            return await GenerateWithChatAPI(client, transcription, model, includeObjectDetectionPrompt);
         }
 
         logger?.LogWarning("No response from Conversations API. Falling back to Chat API.", nameof(LLMShaderGenerator));
-        return await GenerateWithChatAPI(client, transcription, model);
+        return await GenerateWithChatAPI(client, transcription, model, includeObjectDetectionPrompt);
     }
 
     /// <summary>
@@ -844,7 +880,11 @@ public class LLMShaderGenerator : MonoBehaviour
 
         logger?.LogInfo($"Using Claude API with model: {configManager.ShaderModel}", nameof(LLMShaderGenerator));
 
-        bool includeObjectDetectionPrompt = await ShouldIncludeObjectDetectionPromptAsync(transcription);
+        bool conversation = useConversationMode
+            && (claudeConversationManager ??= ClaudeConversationManager.Instance) != null
+            && claudeConversationManager.IsConversationModeActive;
+        bool priorDetectionContext = conversation && claudeConversationManager.HasDetectionContext;
+        bool includeObjectDetectionPrompt = await ShouldIncludeObjectDetectionPromptAsync(transcription) || priorDetectionContext;
         string baseSystemPrompt = BuildSystemPrompt(includeObjectDetectionPrompt);
         if (string.IsNullOrEmpty(baseSystemPrompt))
         {
@@ -853,7 +893,6 @@ public class LLMShaderGenerator : MonoBehaviour
         }
 
         string systemPrompt = baseSystemPrompt;
-        bool conversation = useConversationMode && claudeConversationManager != null && claudeConversationManager.IsConversationModeActive;
         var messages = new List<ClaudeMessage>();
 
         if (conversation)
@@ -1225,8 +1264,11 @@ public class LLMShaderGenerator : MonoBehaviour
             {
                 return response[startIdx..endIdx].Trim('\r', '\n');
             }
+
+            logger?.LogError("LLM response opened a code block without closing it — the shader is cut off.", nameof(LLMShaderGenerator));
+            return null;
         }
-        
+
         return response.Trim();
     }
 

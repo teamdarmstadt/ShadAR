@@ -12,23 +12,23 @@ using OpenAI.Responses;
 public class OpenAIConversationManager : MonoBehaviour
 {
     private const string ConversationStateFileName = "conversation_state.json";
-    
+
     [Header("Configuration")]
     [Tooltip("Enable conversation mode to maintain history across shader generations")]
     [SerializeField] private bool enableConversationMode = true;
-    
+
     [Tooltip("System prompt template file path (relative to StreamingAssets)")]
     [SerializeField] private string systemPromptPath = "Prompts/shader_prompt.txt";
-    
+
     [Header("References")]
     [Tooltip("Reference to the OpenAI Config Manager (optional - will use singleton if not set)")]
     [SerializeField] private OpenAIConfigManager openAIConfigManager;
-    
+
     [Header("Logger")]
     [SerializeField] private Logger logger;
-    
+
     /// <summary>
-    /// Serializable state for persisting conversation ID.
+    /// Serializable state for persisting conversation ID and whether prior turns used object detection.
     /// </summary>
     [Serializable]
     private class ConversationState
@@ -36,31 +36,41 @@ public class OpenAIConversationManager : MonoBehaviour
         public string conversationId = "";
         public string lastUpdated = "";
         public int messageCount = 0;
+        public bool usesObjectDetection = false;
     }
-    
+
     private ConversationState state;
     private string stateFilePath;
     private OpenAI.Responses.Conversation currentConversation;
     private string persistentSystemPromptPath;
-    
+    private Task initializationTask;
+
     /// <summary>
     /// Singleton instance of the conversation manager.
     /// </summary>
     public static OpenAIConversationManager Instance { get; private set; }
-    
+
+    /// <summary>
+    /// Whether conversation mode is configured on this manager (even if lazy initialization has not completed yet).
+    /// </summary>
+    public bool IsConversationEnabled => enableConversationMode;
+
     /// <summary>
     /// Gets whether conversation mode is enabled and initialized.
     /// </summary>
     public bool IsConversationModeActive => enableConversationMode && currentConversation != null;
-    
+
+    /// <summary>
+    /// True when any turn in the current conversation used open-vocabulary object detection, so
+    /// follow-up prompts ("make it more blue") retain the object-detection contract.
+    /// </summary>
+    public bool HasDetectionContext => state != null && state.usesObjectDetection;
+
     /// <summary>
     /// Event fired when conversation is created or updated.
     /// </summary>
     public event Action<OpenAI.Responses.Conversation> OnConversationUpdated;
-    
-    /// <summary>
-    /// Initializes the singleton and loads conversation state.
-    /// </summary>
+
     private void Awake()
     {
         if (Instance != null && Instance != this)
@@ -69,19 +79,16 @@ public class OpenAIConversationManager : MonoBehaviour
             Destroy(this);
             return;
         }
-        
+
         Instance = this;
         DontDestroyOnLoad(gameObject);
-        
+
         stateFilePath = Path.Combine(Application.persistentDataPath, ConversationStateFileName);
         persistentSystemPromptPath = Path.Combine(Application.persistentDataPath, systemPromptPath);
 
         LoadState();
     }
-    
-    /// <summary>
-    /// Initializes the conversation when the component starts.
-    /// </summary>
+
     private async void Start()
     {
         if (!enableConversationMode)
@@ -89,26 +96,10 @@ public class OpenAIConversationManager : MonoBehaviour
             logger?.LogInfo("Conversation mode is disabled.", nameof(OpenAIConversationManager));
             return;
         }
-        
-        // Use singleton instance if no direct reference is set
-        if (openAIConfigManager == null)
-        {
-            openAIConfigManager = OpenAIConfigManager.Instance;
-        }
-        
-        if (openAIConfigManager == null || !openAIConfigManager.IsInitialized)
-        {
-            logger?.LogError("OpenAIConfigManager is not available or not initialized!", nameof(OpenAIConversationManager));
-            enableConversationMode = false;
-            return;
-        }
-        
-        await InitializeConversation();
+
+        await EnsureConversationAsync();
     }
-    
-    /// <summary>
-    /// Called when the component is destroyed.
-    /// </summary>
+
     private void OnDestroy()
     {
         if (Instance == this)
@@ -116,10 +107,7 @@ public class OpenAIConversationManager : MonoBehaviour
             Instance = null;
         }
     }
-    
-    /// <summary>
-    /// Loads conversation state from disk.
-    /// </summary>
+
     private void LoadState()
     {
         if (File.Exists(stateFilePath))
@@ -127,7 +115,7 @@ public class OpenAIConversationManager : MonoBehaviour
             try
             {
                 string json = File.ReadAllText(stateFilePath);
-                state = JsonUtility.FromJson<ConversationState>(json);
+                state = JsonUtility.FromJson<ConversationState>(json) ?? new ConversationState();
                 logger?.LogInfo($"Loaded conversation state. ID: {state.conversationId}, Messages: {state.messageCount}", nameof(OpenAIConversationManager));
             }
             catch (Exception ex)
@@ -142,10 +130,7 @@ public class OpenAIConversationManager : MonoBehaviour
             logger?.LogInfo("No existing conversation state found. Will create new conversation.", nameof(OpenAIConversationManager));
         }
     }
-    
-    /// <summary>
-    /// Saves conversation state to disk.
-    /// </summary>
+
     private void SaveState()
     {
         try
@@ -159,27 +144,61 @@ public class OpenAIConversationManager : MonoBehaviour
             logger?.LogError($"Failed to save conversation state: {ex.Message}", nameof(OpenAIConversationManager));
         }
     }
-    
+
     /// <summary>
-    /// Initializes or retrieves the conversation.
+    /// Ensures a valid OpenAI conversation exists, lazily retrying initialization if Start() ran
+    /// before Android's StreamingAssets prompt copy completed.
     /// </summary>
+    public async Task<OpenAI.Responses.Conversation> EnsureConversationAsync()
+    {
+        if (!enableConversationMode) return null;
+        if (currentConversation != null) return currentConversation;
+
+        if (initializationTask != null)
+        {
+            await initializationTask;
+            return currentConversation;
+        }
+
+        initializationTask = InitializeConversation();
+        try
+        {
+            await initializationTask;
+        }
+        finally
+        {
+            initializationTask = null;
+        }
+
+        return currentConversation;
+    }
+
     private async Task InitializeConversation()
     {
+        if (openAIConfigManager == null)
+        {
+            openAIConfigManager = OpenAIConfigManager.Instance;
+        }
+
+        if (openAIConfigManager == null || !openAIConfigManager.IsInitialized)
+        {
+            logger?.LogWarning("OpenAIConfigManager is not available or not initialized yet.", nameof(OpenAIConversationManager));
+            return;
+        }
+
         var client = openAIConfigManager.Client;
-        
         if (client == null)
         {
             logger?.LogError("OpenAI client is not available!", nameof(OpenAIConversationManager));
             return;
         }
-        
+
         try
         {
-            // Try to retrieve existing conversation
             if (!string.IsNullOrEmpty(state.conversationId))
             {
                 logger?.LogDebug($"Attempting to retrieve conversation: {state.conversationId}", nameof(OpenAIConversationManager));
-                
+
                 try
                 {
                     currentConversation = await client.ConversationsEndpoint.GetConversationAsync(state.conversationId);
@@ -192,25 +211,25 @@ public class OpenAIConversationManager : MonoBehaviour
                     logger?.LogWarning($"Failed to retrieve conversation {state.conversationId}: {ex.Message}. Creating new conversation.", nameof(OpenAIConversationManager));
                 }
             }
-            
-            // Create new conversation with system prompt
-            string systemPrompt = await ReadSystemPrompt();
+
+            string systemPrompt = await GetSystemPromptAsync();
             if (string.IsNullOrEmpty(systemPrompt))
             {
-                logger?.LogError("System prompt is empty. Cannot create conversation.", nameof(OpenAIConversationManager));
+                logger?.LogWarning("System prompt is not ready yet; will retry when generating.", nameof(OpenAIConversationManager));
                 return;
             }
-            
+
             logger?.LogDebug("Creating new conversation with system prompt...", nameof(OpenAIConversationManager));
-            
+
             var createRequest = new CreateConversationRequest(new Message(Role.Developer, systemPrompt));
             currentConversation = await client.ConversationsEndpoint.CreateConversationAsync(createRequest);
-            
+
             state.conversationId = currentConversation.Id;
             state.lastUpdated = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             state.messageCount = 0;
+            state.usesObjectDetection = false;
             SaveState();
-            
+
             logger?.LogInfo($"Created new conversation: {currentConversation.Id}", nameof(OpenAIConversationManager));
             OnConversationUpdated?.Invoke(currentConversation);
         }
@@ -219,20 +238,18 @@ public class OpenAIConversationManager : MonoBehaviour
             logger?.LogError($"Failed to initialize conversation: {ex}", nameof(OpenAIConversationManager));
         }
     }
-    
+
     /// <summary>
-    /// Reads the system prompt from persistent storage.
+    /// Reads the base system prompt with multi-turn conversation instructions.
     /// </summary>
-    private async Task<string> ReadSystemPrompt()
+    public async Task<string> GetSystemPromptAsync()
     {
-        // Copy from StreamingAssets if needed
         if (!File.Exists(persistentSystemPromptPath))
         {
             string sourcePath = Path.Combine(Application.streamingAssetsPath, systemPromptPath);
-            
+
 #if UNITY_ANDROID && !UNITY_EDITOR
-            // On Android, we need to use UnityWebRequest
-            logger?.LogWarning("System prompt not found in persistent storage. Please ensure it's copied from StreamingAssets.", nameof(OpenAIConversationManager));
+            logger?.LogWarning("System prompt not yet in persistent storage (waiting for StreamingAssets copy).", nameof(OpenAIConversationManager));
             return null;
 #else
             if (File.Exists(sourcePath))
@@ -248,19 +265,23 @@ public class OpenAIConversationManager : MonoBehaviour
             }
 #endif
         }
-        
+
         try
         {
             string content = await File.ReadAllTextAsync(persistentSystemPromptPath);
-            
-            // Enhance system prompt with conversation context
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                logger?.LogError($"System prompt is empty: {persistentSystemPromptPath}", nameof(OpenAIConversationManager));
+                return null;
+            }
+
             content += "\n\nCONVERSATION MODE:\n";
             content += "- This is a multi-turn conversation about shader generation\n";
             content += "- User may reference \"previous shader\", \"last shader\", or \"the shader we just made\"\n";
             content += "- User may ask for modifications like \"make it more blue\", \"add a blur\", \"highlight cats instead\"\n";
             content += "- When modifying, maintain the structure and style of the previous shader\n";
             content += "- If starting fresh (no reference to previous), create a new shader from scratch\n";
-            
+
             return content;
         }
         catch (Exception ex)
@@ -269,26 +290,17 @@ public class OpenAIConversationManager : MonoBehaviour
             return null;
         }
     }
-    
-    /// <summary>
-    /// Gets the current conversation object for use in API calls.
-    /// </summary>
+
     public OpenAI.Responses.Conversation GetConversation()
     {
         return currentConversation;
     }
-    
-    /// <summary>
-    /// Gets the conversation ID.
-    /// </summary>
+
     public string GetConversationId()
     {
         return currentConversation?.Id ?? state.conversationId;
     }
-    
-    /// <summary>
-    /// Clears the current conversation and creates a new one.
-    /// </summary>
+
     public async Task ResetConversationAsync()
     {
         if (currentConversation != null && openAIConfigManager?.Client != null)
@@ -303,36 +315,36 @@ public class OpenAIConversationManager : MonoBehaviour
                 logger?.LogWarning($"Failed to delete conversation: {ex.Message}", nameof(OpenAIConversationManager));
             }
         }
-        
+
         currentConversation = null;
         state = new ConversationState();
         SaveState();
-        
-        await InitializeConversation();
+
+        await EnsureConversationAsync();
     }
-    
-    /// <summary>
-    /// Gets conversation summary.
-    /// </summary>
+
     public string GetConversationSummary()
     {
         if (currentConversation == null)
         {
             return "No active conversation.";
         }
-        
+
         return $"Conversation ID: {currentConversation.Id}\n" +
                $"Messages: {state.messageCount}\n" +
                $"Last Updated: {state.lastUpdated}";
     }
-    
+
     /// <summary>
-    /// Updates the message count after receiving a response.
+    /// Updates conversation state after a completed turn.
     /// </summary>
-    public void IncrementMessageCount()
+    public void RecordTurn(bool usedObjectDetection)
     {
         state.messageCount++;
+        state.usesObjectDetection |= usedObjectDetection;
         state.lastUpdated = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         SaveState();
     }
+
+    public void IncrementMessageCount() => RecordTurn(false);
 }
