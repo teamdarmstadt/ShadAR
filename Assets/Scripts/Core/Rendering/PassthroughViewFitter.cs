@@ -26,26 +26,45 @@ public class PassthroughViewFitter : MonoBehaviour
     [SerializeField] private float imageScale = 1f;
 
     private Vector2Int fittedResolution;
+    private PassthroughCameraAccess fittedCamera;
+    private PassthroughCameraAccess cameraOverride;
+
+    private PassthroughCameraAccess ActiveCamera => cameraOverride != null ? cameraOverride : cameraAccess;
+
+    /// <summary>
+    /// Overrides the camera whose intrinsics and lens tilt size/orient this quad (null = use
+    /// <see cref="cameraAccess"/>). Used in Mono mode so the right eye's quad matches the left
+    /// camera's optical axis and crop instead of diverging by the right camera's outward tilt.
+    /// </summary>
+    public void SetCameraOverride(PassthroughCameraAccess overrideCamera)
+    {
+        if (cameraOverride == overrideCamera) return;
+        cameraOverride = overrideCamera;
+        fittedResolution = default;
+        fittedCamera = null;
+    }
 
     private void LateUpdate()
     {
-        if (cameraAccess == null || !cameraAccess.IsPlaying || eyeAnchor == null)
+        var cam = ActiveCamera;
+        if (cam == null || !cam.IsPlaying || eyeAnchor == null)
         {
             return;
         }
-        if (cameraAccess.CurrentResolution == fittedResolution)
+        if (cam == fittedCamera && cam.CurrentResolution == fittedResolution)
         {
             return;
         }
-        if (Fit())
+        if (Fit(cam))
         {
-            fittedResolution = cameraAccess.CurrentResolution;
+            fittedCamera = cam;
+            fittedResolution = cam.CurrentResolution;
         }
     }
 
-    private bool Fit()
+    private bool Fit(PassthroughCameraAccess cam)
     {
-        var intrinsics = cameraAccess.Intrinsics;
+        var intrinsics = cam.Intrinsics;
         Vector2 sensor = intrinsics.SensorResolution;
         Vector2 focal = intrinsics.FocalLength;
         Vector2 principal = intrinsics.PrincipalPoint;
@@ -56,7 +75,7 @@ public class PassthroughViewFitter : MonoBehaviour
 
         // The active resolution is a centered crop of the sensor (mirrors the SDK's
         // internal CalcSensorCropRegion): 1280x960 crops the square sensor vertically.
-        Vector2 current = cameraAccess.CurrentResolution;
+        Vector2 current = cam.CurrentResolution;
         var scale = new Vector2(current.x / sensor.x, current.y / sensor.y);
         scale /= Mathf.Max(scale.x, scale.y);
         var cropMin = Vector2.Scale(sensor, (Vector2.one - scale) * 0.5f);

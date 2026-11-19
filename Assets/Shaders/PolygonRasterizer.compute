@@ -80,9 +80,10 @@ void RasterizePolygon(uint3 id : SV_DispatchThreadID)
     
     // Convert pixel coordinates to normalized [0,1]
     // Note: Y is flipped for Unity coordinate system
+    float denom = max((float)(TextureSize - 1), 1.0);
     float2 uv = float2(
-        (float)id.x / (float)(TextureSize - 1),
-        1.0 - (float)id.y / (float)(TextureSize - 1)
+        (float)id.x / denom,
+        1.0 - (float)id.y / denom
     );
     
     // Test if point is inside polygon

@@ -32,7 +32,14 @@ public class DetectionTracker : MonoBehaviour
     private readonly List<float> stereoDepths = new();
     private float lastUpdateTime;
     private float stereoDepthTime;
-    private int rightEyeFrame = -1;
+    private int rightEyeBuiltVersion = -1;
+    private bool rightEyeCamerasReady;
+
+    /// <summary>Monotonic revision incremented whenever left-eye detections change or expire.</summary>
+    public int Version { get; private set; }
+
+    /// <summary>Monotonic revision incremented whenever right-eye reprojected boxes change.</summary>
+    public int RightEyeVersion { get; private set; }
 
     /// <summary>The latest detections in left-camera viewport space.</summary>
     public List<DetectedObject> CurrentFrameDetections => currentDetections;
@@ -44,7 +51,9 @@ public class DetectionTracker : MonoBehaviour
 
         lastUpdateTime = Time.time;
         stereoDepths.Clear(); // new boxes, new depths
-        rightEyeFrame = -1;
+        rightEyeBuiltVersion = -1;
+        Version++;
+        RightEyeVersion++;
     }
 
     private void Update()
@@ -52,7 +61,11 @@ public class DetectionTracker : MonoBehaviour
         if (currentDetections.Count > 0 && Time.time - lastUpdateTime > maxDetectionAge)
         {
             currentDetections.Clear();
+            rightEyeDetections.Clear();
             stereoDepths.Clear();
+            rightEyeBuiltVersion = -1;
+            Version++;
+            RightEyeVersion++;
         }
     }
 
@@ -67,13 +80,23 @@ public class DetectionTracker : MonoBehaviour
             return currentDetections;
         }
 
-        if (rightEyeFrame == Time.frameCount) return rightEyeDetections;
-        rightEyeFrame = Time.frameCount;
+        bool camerasReady = leftCameraAccess != null && rightCameraAccess != null
+                            && leftCameraAccess.IsPlaying && rightCameraAccess.IsPlaying;
 
         // ponytail: depth is sampled per detection at most every StereoDepthMaxAgeSeconds — one
         // raycast per detection per frame was measurable CPU, and object depth changes slowly.
-        bool refreshDepth = stereoDepths.Count != currentDetections.Count
-                            || Time.unscaledTime - stereoDepthTime > StereoDepthMaxAgeSeconds;
+        // Because both passthrough cameras are rigidly mounted to the headset, reprojection of a
+        // cached depth is head-pose invariant and only needs recomputation when detections, camera
+        // readiness, or sampled depths change.
+        bool refreshDepth = currentDetections.Count > 0
+                            && (stereoDepths.Count != currentDetections.Count
+                                || Time.unscaledTime - stereoDepthTime > StereoDepthMaxAgeSeconds);
+
+        if (!refreshDepth && rightEyeBuiltVersion == Version && rightEyeCamerasReady == camerasReady)
+        {
+            return rightEyeDetections;
+        }
+
         if (refreshDepth)
         {
             stereoDepths.Clear();
@@ -99,6 +122,9 @@ public class DetectionTracker : MonoBehaviour
             rightEyeDetections.Add(detection);
         }
 
+        rightEyeBuiltVersion = Version;
+        rightEyeCamerasReady = camerasReady;
+        RightEyeVersion++;
         return rightEyeDetections;
     }
 }

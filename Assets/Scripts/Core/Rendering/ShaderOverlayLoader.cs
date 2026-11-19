@@ -35,11 +35,21 @@ public class EyeRenderData
     [System.NonSerialized] public Material defaultMaterial;
     [System.NonSerialized] public Material currentMaterial;
     [System.NonSerialized] public ComputeBuffer detectionBuffer;
+    [System.NonSerialized] public Material uploadedMaterial;
+    [System.NonSerialized] public int uploadedVersion = -1;
+    [System.NonSerialized] public int uploadedDetectionCount;
+
+    public void InvalidateUploadState()
+    {
+        uploadedMaterial = null;
+        uploadedVersion = -1;
+    }
 
     public void ReleaseBuffer()
     {
         detectionBuffer?.Release();
         detectionBuffer = null;
+        InvalidateUploadState();
     }
 
     public Texture GetCameraTexture()
@@ -52,7 +62,7 @@ public class EyeRenderData
 
 /// <summary>
 /// Renders the passthrough feed of each eye onto its quad, applies the active generated shader
-/// and feeds it the per-eye detections (buffer + mask atlas) every frame.
+/// and feeds it the per-eye detections (buffer + mask atlas) when detections change.
 /// </summary>
 public class ShaderOverlayLoader : MonoBehaviour
 {
@@ -102,9 +112,13 @@ public class ShaderOverlayLoader : MonoBehaviour
     [SerializeField] private float cameraKickTimeoutSeconds = 1.5f;
 
     private ShaderBundleManager shaderBundleManager;
-    private OptimizedMaskAtlas leftEyeAtlas;
-    private OptimizedMaskAtlas rightEyeAtlas;
+    // Mask textures are bounding-box-local and identical for both eyes, so one shared atlas
+    // halves VRAM and avoids duplicating GPU blits/copies per inference frame.
+    private OptimizedMaskAtlas maskAtlas;
+    private int maskAtlasVersion = -1;
+    private int[] cachedMaskIndices;
     private DetectionTracker detectionTracker;
+    private PassthroughViewFitter rightEyeFitter;
     private ShaderDetection[] shaderDetectionsBuffer = new ShaderDetection[16];
     private readonly List<Texture> maskListBuffer = new(16);
 
@@ -123,9 +137,10 @@ public class ShaderOverlayLoader : MonoBehaviour
     {
         stereoRendering = PlayerPrefs.GetInt(StereoRenderingPref, stereoRendering ? 1 : 0) == 1;
 
-        leftEyeAtlas = new OptimizedMaskAtlas(maskAtlasResolution);
-        rightEyeAtlas = new OptimizedMaskAtlas(maskAtlasResolution);
+        maskAtlas = new OptimizedMaskAtlas(maskAtlasResolution);
         detectionTracker = detectionProviderSource != null ? detectionProviderSource.GetComponent<DetectionTracker>() : null;
+        rightEyeFitter = rightEye.meshRenderer != null ? rightEye.meshRenderer.GetComponent<PassthroughViewFitter>() : null;
+        SyncRightEyeFitter();
 
         shaderBundleManager = new ShaderBundleManager(logger);
         StartCoroutine(AssignDefaultMaterials());
@@ -150,8 +165,13 @@ public class ShaderOverlayLoader : MonoBehaviour
     {
         leftEye.ReleaseBuffer();
         rightEye.ReleaseBuffer();
-        leftEyeAtlas?.Dispose();
-        rightEyeAtlas?.Dispose();
+        if (rightEye.currentMaterial != null && rightEye.currentMaterial != rightEye.defaultMaterial)
+        {
+            Destroy(rightEye.currentMaterial);
+        }
+        if (leftEye.defaultMaterial != null) Destroy(leftEye.defaultMaterial);
+        if (rightEye.defaultMaterial != null) Destroy(rightEye.defaultMaterial);
+        maskAtlas?.Dispose();
     }
 
     private void Update()
@@ -171,16 +191,29 @@ public class ShaderOverlayLoader : MonoBehaviour
 
     /// <summary>
     /// Switches between per-eye stereo and mono (both eyes = left feed). Persisted in PlayerPrefs.
-    /// Only the feed changes, never the OpenXR render mode, so it is safe to flip at runtime.
+    /// Only the feed and right-quad optical alignment change, never the OpenXR render mode.
     /// </summary>
     public void SetStereoRendering(bool stereo)
     {
         if (stereoRendering == stereo) return;
         stereoRendering = stereo;
+        rightEye.InvalidateUploadState();
+        SyncRightEyeFitter();
         PlayerPrefs.SetInt(StereoRenderingPref, stereo ? 1 : 0);
         PlayerPrefs.Save();
         logger?.LogInfo($"Render mode -> {(stereo ? "Stereo (per-eye)" : "Mono (left feed both eyes)")}.",
             nameof(ShaderOverlayLoader));
+    }
+
+    private void SyncRightEyeFitter()
+    {
+        if (rightEyeFitter == null && rightEye.meshRenderer != null)
+        {
+            rightEyeFitter = rightEye.meshRenderer.GetComponent<PassthroughViewFitter>();
+        }
+        // In Mono mode, align QuadRight with the left camera's intrinsics/lens tilt relative to
+        // RightEyeAnchor so displaying the left feed produces zero disparity instead of lens-tilt divergence.
+        rightEyeFitter?.SetCameraOverride(stereoRendering ? null : leftEye.cameraAccess);
     }
 
     private void UpdateEyeMaterial(EyeRenderData eye, PassthroughCameraAccess cameraAccess)
@@ -236,9 +269,10 @@ public class ShaderOverlayLoader : MonoBehaviour
             return;
         }
 
+        var sourceEye = (!stereoRendering && eye == rightEye) ? leftEye : eye;
         eye.defaultMaterial = new Material(Shader.Find(DefaultUnlitShader));
         eye.defaultMaterial.SetFloat(EyeIndexProperty, eyeIndex);
-        eye.defaultMaterial.mainTexture = eye.GetCameraTexture(); // may be null; Update binds it later
+        eye.defaultMaterial.mainTexture = sourceEye.GetCameraTexture(); // may be null; Update binds it later
         eye.currentMaterial = eye.defaultMaterial;
         eye.meshRenderer.material = eye.defaultMaterial;
     }
@@ -345,12 +379,17 @@ public class ShaderOverlayLoader : MonoBehaviour
 
     /// <summary>
     /// Binds the live detections to an arbitrary material (the history menu's selected tile).
-    /// Reuses the left-eye buffer and atlas, which hold the same data this frame.
+    /// Reuses the left-eye ComputeBuffer and shared mask atlas without re-uploading GPU data
+    /// when leftEye is already current for this detection version.
     /// </summary>
     public void BindCurrentDetectionsToPreview(Material material)
     {
         if (material == null) return;
-        UpdateDetectionBuffer(material, leftEye.cameraAccess, leftEye);
+
+        // Ensure leftEye.detectionBuffer and maskAtlas reflect the latest detections, then bind
+        // the buffer/atlas uniforms onto the preview material without mutating leftEye.uploadedMaterial.
+        EnsureEyeBufferData(leftEye.cameraAccess, leftEye);
+        BindEyeResourcesToMaterial(material, leftEye);
     }
 
     // ------------------------------------------------------------------ applying shaders
@@ -371,12 +410,15 @@ public class ShaderOverlayLoader : MonoBehaviour
 
     private void ApplyShaderToEye(EyeRenderData eye, Material mat, float eyeIndex)
     {
+        var sourceEye = (!stereoRendering && eye == rightEye) ? leftEye : eye;
+
         // Generated shaders must carry the _EyeIndex gate (see shader_prompt.txt); without it
         // SetFloat is a no-op and both quads draw into both eyes.
         mat.SetFloat(EyeIndexProperty, eyeIndex);
         mat.renderQueue = 3000;
-        mat.mainTexture = eye.GetCameraTexture();
-        UpdateDetectionBuffer(mat, eye.cameraAccess, eye);
+        mat.mainTexture = sourceEye.GetCameraTexture();
+        eye.InvalidateUploadState();
+        UpdateDetectionBuffer(mat, sourceEye.cameraAccess, eye);
 
         eye.currentMaterial = mat;
         if (eye.meshRenderer != null) eye.meshRenderer.material = mat;
@@ -388,7 +430,10 @@ public class ShaderOverlayLoader : MonoBehaviour
     public void ResetShader()
     {
         ResetEye(leftEye);
-        if (rightEye.currentMaterial != rightEye.defaultMaterial) Destroy(rightEye.currentMaterial);
+        if (rightEye.currentMaterial != null && rightEye.currentMaterial != rightEye.defaultMaterial)
+        {
+            Destroy(rightEye.currentMaterial);
+        }
         ResetEye(rightEye);
 
         shaderBundleManager.ClearSelection();
@@ -405,19 +450,41 @@ public class ShaderOverlayLoader : MonoBehaviour
     // ------------------------------------------------------------------ detections
 
     /// <summary>
-    /// Uploads this eye's detections (projected into its camera by the DetectionTracker) and the
-    /// mask atlas to the material. The atlas only re-uploads cells whose mask changed.
+    /// Uploads this eye's detections and shared mask atlas to the material only when detections
+    /// (or projected right-eye depths) or the bound material actually changed.
     /// </summary>
     private void UpdateDetectionBuffer(Material material, PassthroughCameraAccess eyeCameraAccess, EyeRenderData eyeData)
     {
+        bool updated = EnsureEyeBufferData(eyeCameraAccess, eyeData);
+        if (updated || eyeData.uploadedMaterial != material)
+        {
+            BindEyeResourcesToMaterial(material, eyeData);
+            eyeData.uploadedMaterial = material;
+        }
+    }
+
+    private bool EnsureEyeBufferData(PassthroughCameraAccess eyeCameraAccess, EyeRenderData eyeData)
+    {
         List<DetectedObject> detections;
+        int targetVersion = -1;
+        int baseVersion = -1;
+
         if (detectionTracker != null && eyeCameraAccess != null)
         {
             detections = detectionTracker.GetDetectionsForEye(eyeCameraAccess);
+            baseVersion = detectionTracker.Version;
+            bool isRightStereo = eyeCameraAccess == rightEye.cameraAccess
+                                 && rightEye.cameraAccess != leftEye.cameraAccess;
+            targetVersion = isRightStereo ? detectionTracker.RightEyeVersion : baseVersion;
         }
         else
         {
             detections = DetectionProvider?.CurrentDetections ?? NoDetections;
+        }
+
+        if (targetVersion >= 0 && eyeData.detectionBuffer != null && eyeData.uploadedVersion == targetVersion)
+        {
+            return false;
         }
 
         int detectionCount = detections.Count;
@@ -428,44 +495,16 @@ public class ShaderOverlayLoader : MonoBehaviour
         {
             eyeData.ReleaseBuffer();
             eyeData.detectionBuffer = new ComputeBuffer(bufferSize, Marshal.SizeOf<ShaderDetection>());
+            eyeData.uploadedMaterial = null;
         }
         if (shaderDetectionsBuffer.Length < bufferSize)
         {
             shaderDetectionsBuffer = new ShaderDetection[bufferSize];
         }
 
-        var atlas = eyeCameraAccess == leftEye.cameraAccess ? leftEyeAtlas : rightEyeAtlas;
+        UpdateSharedMaskAtlas(detections, baseVersion);
 
-        maskListBuffer.Clear();
-        for (int i = 0; i < detectionCount; i++)
-        {
-            if (detections[i].MaskTexture != null) maskListBuffer.Add(detections[i].MaskTexture);
-        }
-
-        int[] maskIndices = null;
-        if (atlas != null && maskListBuffer.Count > 0)
-        {
-            maskIndices = atlas.UpdateMasks(maskListBuffer);
-        }
-        else
-        {
-            atlas?.UpdateMasks(null);
-        }
-
-        var atlasTexture = maskIndices != null ? atlas.AtlasTexture : null;
-        if (atlasTexture != null)
-        {
-            material.SetTexture(MaskTextureProperty, atlasTexture);
-            material.SetInt(MaskCountProperty, atlas.MaskCount);
-            material.SetInt(MaxMasksProperty, atlas.GridSize);
-            material.SetInt(HasMaskProperty, 1);
-        }
-        else
-        {
-            material.SetInt(HasMaskProperty, 0);
-            material.SetInt(MaskCountProperty, 0);
-        }
-
+        int[] maskIndices = cachedMaskIndices;
         int maskCursor = 0;
         for (int i = 0; i < detectionCount; i++)
         {
@@ -488,7 +527,66 @@ public class ShaderOverlayLoader : MonoBehaviour
         }
 
         eyeData.detectionBuffer.SetData(shaderDetectionsBuffer, 0, 0, bufferSize);
-        material.SetInt(DetectionCountProperty, detectionCount);
-        material.SetBuffer(DetectionsBufferProperty, eyeData.detectionBuffer);
+        eyeData.uploadedVersion = targetVersion;
+        eyeData.uploadedDetectionCount = detectionCount;
+        return true;
+    }
+
+    private void UpdateSharedMaskAtlas(List<DetectedObject> detections, int baseVersion)
+    {
+        if (maskAtlas == null)
+        {
+            cachedMaskIndices = null;
+            return;
+        }
+
+        if (baseVersion >= 0 && maskAtlasVersion == baseVersion)
+        {
+            return;
+        }
+
+        maskListBuffer.Clear();
+        for (int i = 0; i < detections.Count; i++)
+        {
+            if (detections[i].MaskTexture != null) maskListBuffer.Add(detections[i].MaskTexture);
+        }
+
+        if (maskListBuffer.Count > 0)
+        {
+            cachedMaskIndices = maskAtlas.UpdateMasks(maskListBuffer);
+        }
+        else
+        {
+            maskAtlas.UpdateMasks(null);
+            cachedMaskIndices = null;
+        }
+
+        maskAtlasVersion = baseVersion;
+    }
+
+    private void BindEyeResourcesToMaterial(Material material, EyeRenderData eyeData)
+    {
+        var atlasTexture = cachedMaskIndices != null && cachedMaskIndices.Length > 0 && maskAtlas != null
+            ? maskAtlas.AtlasTexture
+            : null;
+
+        if (atlasTexture != null)
+        {
+            material.SetTexture(MaskTextureProperty, atlasTexture);
+            material.SetInt(MaskCountProperty, maskAtlas.MaskCount);
+            material.SetInt(MaxMasksProperty, maskAtlas.GridSize);
+            material.SetInt(HasMaskProperty, 1);
+        }
+        else
+        {
+            material.SetInt(HasMaskProperty, 0);
+            material.SetInt(MaskCountProperty, 0);
+        }
+
+        material.SetInt(DetectionCountProperty, eyeData.uploadedDetectionCount);
+        if (eyeData.detectionBuffer != null)
+        {
+            material.SetBuffer(DetectionsBufferProperty, eyeData.detectionBuffer);
+        }
     }
 }
