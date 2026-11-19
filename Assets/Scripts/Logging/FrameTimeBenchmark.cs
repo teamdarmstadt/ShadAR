@@ -33,7 +33,15 @@ public class FrameTimeBenchmark : MonoBehaviour
     /// </summary>
     public void StartRecording(float durationSec, Func<bool> cameraUpdated, Action<FrameTimeStats> callback)
     {
-        if (isRecording) return;
+        if (isRecording)
+        {
+            // Finalize the superseded recording with the samples gathered so far rather than
+            // silently dropping the new recording request.
+            var earlyFrames = new List<float>(frameTimes);
+            var prevCallback = onComplete;
+            onComplete = null;
+            StartCoroutine(ComputeAndInvoke(earlyFrames, prevCallback));
+        }
 
         frameTimes.Clear();
         remainingTime = durationSec;
@@ -68,20 +76,21 @@ public class FrameTimeBenchmark : MonoBehaviour
         {
             isRecording = false;
             var localFrameTimes = new List<float>(frameTimes);
-            StartCoroutine(ComputeAndFinish(localFrameTimes));
+            var cb = onComplete;
+            onComplete = null;
+            cameraUpdatedCheck = null;
+            StartCoroutine(ComputeAndInvoke(localFrameTimes, cb));
         }
     }
 
-    private IEnumerator ComputeAndFinish(List<float> frames)
+    private IEnumerator ComputeAndInvoke(List<float> frames, Action<FrameTimeStats> callback)
     {
         var computeTask = Task.Run(() => ComputeStats(frames));
-        
+
         while (!computeTask.IsCompleted)
             yield return null;
 
-        onComplete?.Invoke(computeTask.Result);
-        onComplete = null;
-        cameraUpdatedCheck = null;
+        callback?.Invoke(computeTask.Result);
     }
 
     private FrameTimeStats ComputeStats(List<float> frames)

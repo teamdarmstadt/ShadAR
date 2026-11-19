@@ -66,11 +66,13 @@ public class SettingsMenu : MonoBehaviour, IMenu
     private readonly List<(TMP_Text label, Func<string> value)> valueLabels = new();
     private readonly List<(Button button, CanvasGroup group, Func<bool> interactable)> conditionalRows = new();
     private readonly Dictionary<LLMShaderGenerator.LlmProvider, List<string>> fetchedModels = new();
+    private readonly Dictionary<LLMShaderGenerator.LlmProvider, System.Threading.Tasks.Task<List<string>>> inFlightModelFetches = new();
     private RectTransform panelRect;
     private TMP_Dropdown modelDropdown;
     private List<string> shownModels = new();
     private ControllerTooltips.Hint hint;
     private bool built;
+    private int modelRefreshVersion;
 
     private IDetectionProvider DetectionProvider =>
         (detectionProviderBehaviour as IDetectionProvider) ?? shaderOverlayLoader?.DetectionProvider;
@@ -400,21 +402,51 @@ public class SettingsMenu : MonoBehaviour, IMenu
     {
         if (modelDropdown == null || shaderGenerator == null) return;
 
+        int requestVersion = ++modelRefreshVersion;
         var provider = shaderGenerator.SelectedProvider;
         ShowModels(null);
 
-        if (!fetchedModels.ContainsKey(provider))
+        if (!fetchedModels.TryGetValue(provider, out var models))
         {
-            // Greyed out while loading, so a one-entry list reads as "not there yet", not "that's all".
             modelDropdown.interactable = false;
-            var models = await shaderGenerator.ListShaderModelsAsync();
-            modelDropdown.interactable = true;
+            try
+            {
+                if (!inFlightModelFetches.TryGetValue(provider, out var fetchTask))
+                {
+                    fetchTask = shaderGenerator.ListShaderModelsAsync();
+                    inFlightModelFetches[provider] = fetchTask;
+                }
+
+                models = await fetchTask;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"{nameof(SettingsMenu)}: model list fetch failed: {ex.Message}");
+                models = null;
+            }
+            finally
+            {
+                inFlightModelFetches.Remove(provider);
+                if (this != null && modelDropdown != null && requestVersion == modelRefreshVersion)
+                {
+                    modelDropdown.interactable = true;
+                }
+            }
+
+            if (this == null || modelDropdown == null) return;
             if (models == null || models.Count == 0) return;
             fetchedModels[provider] = models;
         }
+        else
+        {
+            modelDropdown.interactable = true;
+        }
 
-        // The provider may have been flipped while the list was loading.
-        if (provider == shaderGenerator.SelectedProvider) ShowModels(fetchedModels[provider]);
+        // Only apply if this is still the latest refresh for the currently selected provider.
+        if (requestVersion == modelRefreshVersion && provider == shaderGenerator.SelectedProvider)
+        {
+            ShowModels(models);
+        }
     }
 
     private void ShowModels(List<string> models)

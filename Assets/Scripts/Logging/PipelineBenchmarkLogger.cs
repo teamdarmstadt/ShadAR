@@ -110,8 +110,20 @@ public class PipelineBenchmarkLogger : MonoBehaviour
     {
         if (currentSession == null) return;
 
-        currentSession.RecordTimestamp(finalStageName);
-        currentSession.ShaderName = resultName;
+        // Ignore manual history-menu shader switches while a voice prompt is still in flight
+        // (before QuestPackager has delivered that prompt's compiled bundle).
+        if (currentSession.HasTimestamp("speech_complete") && !currentSession.HasTimestamp("asset_bundle_received"))
+        {
+            return;
+        }
+
+        // Detach the session immediately so a follow-up prompt started during the 5-second
+        // frame-time recording window cannot clobber or be closed by this session's callback.
+        var completedSession = currentSession;
+        currentSession = null;
+
+        completedSession.RecordTimestamp(finalStageName);
+        completedSession.ShaderName = resultName;
 
         logger?.LogDebug(
             $"Result applied: {resultName}. Recording frame times for {frameRecordDuration}s.",
@@ -125,13 +137,13 @@ public class PipelineBenchmarkLogger : MonoBehaviour
 
             frameTimeBenchmark.StartRecording(frameRecordDuration, cameraCheck, stats =>
             {
-                currentSession.FrameTimeStats = stats;
-                WriteAndClose();
+                completedSession.FrameTimeStats = stats;
+                WriteSession(completedSession);
             });
         }
         else
         {
-            WriteAndClose();
+            WriteSession(completedSession);
         }
     }
 
@@ -142,14 +154,13 @@ public class PipelineBenchmarkLogger : MonoBehaviour
 
     // ------------------------------------------------------------------ internals
 
-    private void WriteAndClose()
+    private void WriteSession(BenchmarkSession session)
     {
-        if (currentSession == null) return;
+        if (session == null) return;
 
-        BenchmarkLogWriter.WriteLog(logFolderPath, currentSession, logger);
-        logger?.LogInfo($"Benchmark log written for session {currentSession.SessionId ?? currentSession.RequestId}",
+        BenchmarkLogWriter.WriteLog(logFolderPath, session, logger);
+        logger?.LogInfo($"Benchmark log written for session {session.SessionId ?? session.RequestId}",
             nameof(PipelineBenchmarkLogger));
-        currentSession = null;
     }
 
 }

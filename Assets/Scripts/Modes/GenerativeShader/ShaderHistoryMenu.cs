@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using System.Text.RegularExpressions;
 using Networking;
@@ -11,7 +12,8 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
 {
     private const string TimestampFormat = "yyyyMMdd_HHmmss";
     private const string DisplayDateFormat = "yyyy-MM-dd HH:mm:ss";
-    private const string ParsePattern = @"^(.*?)(?:_([0-9]{8}_[0-9]{6}))?$";
+    private const string ParsePattern = @"^(.*?)(?:_([0-9]{8}_[0-9]{6})(?:_[0-9]+)?)?$";
+    private static readonly Regex ParseRegex = new(ParsePattern, RegexOptions.Compiled);
     
     // Same palette as the settings panel (UiKit), so both read as one interface.
     private static Color HighlightColor => UiKit.AccentColor;
@@ -70,6 +72,7 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
 
     private int selectedIndex;
     private ShaderPreviewRenderer previewRenderer;
+    private RawImage noneTilePreview;
 
     // Debounced per-shader vocabulary activation for the selected-tile detection preview.
     private float selectionChangedTime;
@@ -92,8 +95,8 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
     {
         tooltip = ControllerTooltips.Register(openButton, "Shader History", menu: this);
         bindSelectedDetectionsCached = BindSelectedDetections;
-
-        PopulateMenu();
+        // Defer history AssetBundle scanning until the menu is actually opened so startup
+        // neither stalls on disk loads nor locks preview aspect ratio before the camera plays.
     }
 
     /// <summary>
@@ -110,6 +113,16 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
         {
             if (enableLivePreviews && previewRenderer != null && shaderOverlayLoader != null)
             {
+                var feed = shaderOverlayLoader.GetCurrentCameraFeed();
+                if (noneTilePreview != null && feed != null && noneTilePreview.texture != feed)
+                {
+                    noneTilePreview.texture = feed;
+                }
+                if (feed != null && feed.height > 0 && previewRenderer.UpdateAspect((float)feed.width / feed.height))
+                {
+                    RebindPreviewTextures();
+                }
+
                 if (previewSelectedWithDetections)
                 {
                     float now = Time.unscaledTime;
@@ -132,7 +145,7 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
                     }
                 }
 
-                previewRenderer.Tick(shaderOverlayLoader.GetCurrentCameraFeed(), bindSelectedDetectionsCached);
+                previewRenderer.Tick(feed, bindSelectedDetectionsCached);
             }
         }
     }
@@ -209,15 +222,15 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
     /// </summary>
     private void PopulateMenuInternal()
     {
+        if (this == null || contentParent == null) return;
+
         ClearMenuContent();
         EnsureScrollContentFitter();
         EnsurePreviewRenderer();
-        // History may have changed (new/removed bundles) — drop stale preview slots so
-        // they are rebuilt against the freshly loaded materials.
-        previewRenderer?.ClearSlots();
+        previewRenderer?.TrimSlots(shaderOverlayLoader.GetShaderCount());
         CreateNoneTile();
         CreateShaderTiles();
-        UpdateTileHighlight();
+        UpdateTileHighlight(scrollIntoView: true);
     }
 
     /// <summary>
@@ -246,8 +259,28 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
     private void EnsurePreviewRenderer()
     {
         if (!enableLivePreviews) return;
-        previewRenderer ??= new ShaderPreviewRenderer(previewResolution, GetCameraAspect());
+        float aspect = GetCameraAspect();
+        if (previewRenderer == null)
+        {
+            previewRenderer = new ShaderPreviewRenderer(previewResolution, aspect);
+        }
+        else
+        {
+            previewRenderer.UpdateAspect(aspect);
+        }
         previewRenderer.PreviewsPerFrame = previewsPerFrame;
+    }
+
+    private void RebindPreviewTextures()
+    {
+        if (previewRenderer == null || contentParent == null) return;
+        int shaderCount = shaderOverlayLoader.GetShaderCount();
+        for (int i = 0; i < shaderCount && (i + 1) < contentParent.childCount; i++)
+        {
+            var material = shaderOverlayLoader.GetShaderMaterial(i);
+            var previewRT = previewRenderer.EnsureSlot(i, material);
+            AssignPreview(contentParent.GetChild(i + 1).gameObject, previewRT);
+        }
     }
 
     /// <summary>
@@ -318,11 +351,13 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
         }
 
         // "None" = raw passthrough: show the live camera feed directly (already live).
+        noneTilePreview = noneTile.GetComponentInChildren<RawImage>(true);
         if (enableLivePreviews)
         {
             AssignPreview(noneTile, shaderOverlayLoader.GetCurrentCameraFeed());
         }
 
+        BindHoverSelection(noneTile, 0);
         noneTile.name = "ShaderTile_None";
     }
 
@@ -374,7 +409,23 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
             AssignPreview(tile, previewRT);
         }
 
+        BindHoverSelection(tile, index + 1);
         tile.name = $"ShaderTile_{index}";
+    }
+
+    private void BindHoverSelection(GameObject tile, int tileIndex)
+    {
+        var trigger = tile.GetComponent<EventTrigger>();
+        if (trigger == null) trigger = tile.AddComponent<EventTrigger>();
+
+        var entry = new EventTrigger.Entry { eventID = EventTriggerType.PointerEnter };
+        entry.callback.AddListener(_ =>
+        {
+            if (selectedIndex == tileIndex) return;
+            selectedIndex = tileIndex;
+            UpdateTileHighlight(scrollIntoView: false);
+        });
+        trigger.triggers.Add(entry);
     }
 
     /// <summary>
@@ -398,7 +449,7 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
     /// </summary>
     private void ParseDisplayName(string displayName, out string name, out string timestamp)
     {
-        var match = Regex.Match(displayName, ParsePattern, RegexOptions.Compiled);
+        var match = ParseRegex.Match(displayName ?? string.Empty);
         name = match.Groups[1].Value;
         
         if (match.Groups[2].Success)
@@ -537,7 +588,7 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
     /// background), points the preview renderer at the selected slot, and schedules its
     /// vocabulary activation. Scrolls the selection into view.
     /// </summary>
-    private void UpdateTileHighlight()
+    private void UpdateTileHighlight(bool scrollIntoView = true)
     {
         int count = GetSelectableCount();
         selectedIndex = Mathf.Clamp(selectedIndex, 0, Mathf.Max(0, count - 1));
@@ -576,7 +627,10 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
             selectedDetectionsActive = false;
         }
 
-        ScrollToSelectedTile();
+        if (scrollIntoView)
+        {
+            ScrollToSelectedTile();
+        }
     }
 
     private static readonly Vector3[] CornerBuffer = new Vector3[4];
@@ -636,6 +690,10 @@ public class ShaderHistoryMenu : MonoBehaviour, IMenu
     /// </summary>
     private void OnBundleReceived()
     {
-        RefreshMenu();
+        if (IsMenuOpen)
+        {
+            selectedIndex = shaderOverlayLoader.GetShaderCount() + 1;
+            RefreshMenu();
+        }
     }
 }

@@ -25,8 +25,17 @@ public class BenchmarkSession
 
     public BenchmarkSession(string mode)
     {
-        RequestId = DateTime.Now.ToString("yyyyMMddHHmm");
+        RequestId = DateTime.Now.ToString("yyyyMMddHHmmssfff");
         Mode = mode;
+    }
+
+    public bool HasTimestamp(string stageName)
+    {
+        for (int i = 0; i < timestamps.Count; i++)
+        {
+            if (timestamps[i].name == stageName) return true;
+        }
+        return false;
     }
 
     /// <summary>

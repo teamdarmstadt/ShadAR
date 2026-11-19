@@ -34,6 +34,8 @@ public class Logger : MonoBehaviour
     private float busySince = -1f; // >= 0 while a step runs; the status then counts its seconds
     private int shownSeconds;
     private string logFilePath;
+    private StreamWriter logWriter;
+    private bool pendingFlush;
     private int mainThreadId;
 
     private void Awake()
@@ -44,12 +46,38 @@ public class Logger : MonoBehaviour
         if (!logToFile) return;
         try
         {
-            File.AppendAllText(logFilePath, $"\n[{DateTime.Now}] Logger initialized.\n");
+            var stream = new FileStream(logFilePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite, 4096);
+            logWriter = new StreamWriter(stream, System.Text.Encoding.UTF8) { AutoFlush = false };
+            logWriter.WriteLine($"\n[{DateTime.Now}] Logger initialized.");
+            logWriter.Flush();
         }
         catch (Exception ex)
         {
             Debug.LogWarning($"[Logger] Failed to initialize log file: {ex.Message}");
             logToFile = false;
+        }
+    }
+
+    private void OnApplicationPause(bool paused)
+    {
+        if (paused) FlushWriter();
+    }
+
+    private void OnDestroy()
+    {
+        while (offThreadLines.TryDequeue(out var line))
+        {
+            WriteLog(line.formatted, line.message, line.level);
+        }
+        if (logWriter != null)
+        {
+            try
+            {
+                logWriter.Flush();
+                logWriter.Dispose();
+            }
+            catch { }
+            logWriter = null;
         }
     }
 
@@ -64,10 +92,30 @@ public class Logger : MonoBehaviour
             ApplyStatus(update.text, update.busy);
         }
 
+        if (pendingFlush)
+        {
+            FlushWriter();
+        }
+
         if (busySince >= 0f && (int)(Time.time - busySince) != shownSeconds)
         {
             shownSeconds = (int)(Time.time - busySince);
             ShowStatus();
+        }
+    }
+
+    private void FlushWriter()
+    {
+        pendingFlush = false;
+        if (logWriter == null) return;
+        try
+        {
+            logWriter.Flush();
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Logger] Failed to flush log file: {ex.Message}");
+            logToFile = false;
         }
     }
 
@@ -148,11 +196,20 @@ public class Logger : MonoBehaviour
             ApplyStatus($"{level}: {message}", false);
         }
 
-        if (logToFile)
+        if (logToFile && logWriter != null)
         {
             try
             {
-                File.AppendAllText(logFilePath, formattedMessage + "\n");
+                logWriter.WriteLine(formattedMessage);
+                if (level >= LogLevel.Warning)
+                {
+                    logWriter.Flush();
+                    pendingFlush = false;
+                }
+                else
+                {
+                    pendingFlush = true;
+                }
             }
             catch (Exception ex)
             {

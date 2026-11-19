@@ -444,7 +444,9 @@ public class ControllerTooltips : MonoBehaviour
             tooltip.Bone = null;
             return;
         }
-        if (tooltip.Bone != null && Time.unscaledTime < tooltip.NextResolveTime)
+        // Throttle even while Bone == null ("while a bone is missing"), otherwise GetComponentsInChildren
+        // allocates and walks the whole controller hierarchy every frame when models are absent.
+        if (Time.unscaledTime < tooltip.NextResolveTime)
         {
             return;
         }

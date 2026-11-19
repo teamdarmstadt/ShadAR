@@ -14,7 +14,7 @@ public class ShaderBundleManager
 {
     private const string BundleFileName = "shader.bundle";
     private const string SessionFolderPattern = "shader_*";
-    private static readonly Regex SessionFolderRegex = new(@"^shader_\d{8}_\d{6}$");
+    private static readonly Regex SessionFolderRegex = new(@"^shader_\d{8}_\d{6}(?:_\d+)?$", RegexOptions.Compiled);
 
     private readonly Logger logger;
 
@@ -90,7 +90,10 @@ public class ShaderBundleManager
 
     private IEnumerator LoadAndStore(string bundlePath, string displayName)
     {
-        var bundle = AssetBundle.LoadFromFile(bundlePath);
+        var bundleRequest = AssetBundle.LoadFromFileAsync(bundlePath);
+        yield return bundleRequest;
+
+        var bundle = bundleRequest.assetBundle;
         if (bundle == null)
         {
             // The two real causes are a bundle built by a different Unity version or for a
@@ -104,7 +107,14 @@ public class ShaderBundleManager
         }
 
         var shaderPath = bundle.GetAllAssetNames().FirstOrDefault(a => a.EndsWith(".shader"));
-        var shader = shaderPath != null ? bundle.LoadAsset<Shader>(shaderPath) : null;
+        Shader shader = null;
+        if (shaderPath != null)
+        {
+            var assetRequest = bundle.LoadAssetAsync<Shader>(shaderPath);
+            yield return assetRequest;
+            shader = assetRequest.asset as Shader;
+        }
+
         if (shader == null)
         {
             logger?.LogError($"No shader in bundle {displayName}.", nameof(ShaderBundleManager));
@@ -116,7 +126,6 @@ public class ShaderBundleManager
         ShaderHistory.Add((bundlePath, displayName, shader.name, mat));
 
         bundle.Unload(false);
-        yield return null;
     }
 
     /// <summary>

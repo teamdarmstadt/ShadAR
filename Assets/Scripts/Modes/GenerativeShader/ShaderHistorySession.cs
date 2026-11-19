@@ -36,11 +36,19 @@ public class ShaderHistorySession
     }
 
     /// <summary>
-    /// Starts a new session with a timestamp-based folder name.
+    /// Starts a new session with a unique timestamp-based folder name.
     /// </summary>
     public static ShaderHistorySession StartNewSession()
     {
-        return new ShaderHistorySession(SessionFolderPrefix + DateTime.Now.ToString(SessionIdFormat));
+        string baseDir = GetHistoryBaseFolderPath();
+        string baseName = SessionFolderPrefix + DateTime.Now.ToString(SessionIdFormat);
+        string candidate = baseName;
+        int suffix = 2;
+        while (Directory.Exists(Path.Combine(baseDir, candidate)))
+        {
+            candidate = $"{baseName}_{suffix++}";
+        }
+        return new ShaderHistorySession(candidate);
     }
 
     public void SaveTranscription(string transcriptionText)

@@ -10,15 +10,10 @@ using UnityEngine;
 /// Every tick a few slots (round-robin) are refreshed by blitting the current camera
 /// feed through their material — so the whole grid looks live at a fraction of the cost
 /// of rendering every cell every frame.
-///
-/// Note on detections: a zero-length detection buffer is bound (DetectionCount = 0), so
-/// detection-driven shaders render plain passthrough in previews (their highlights only
-/// exist for the one vocabulary currently active on the server). Full-frame effect
-/// shaders preview correctly.
 /// </summary>
 public class ShaderPreviewRenderer : IDisposable
 {
-    private static readonly int MainTexProp = Shader.PropertyToID("_MainTex");
+    private static readonly int EyeIndexProp = Shader.PropertyToID("_EyeIndex");
     private static readonly int BaseMapProp = Shader.PropertyToID("_BaseMap");
     private static readonly int DetectionsProp = Shader.PropertyToID("_Detections");
     private static readonly int DetectionCountProp = Shader.PropertyToID("_DetectionCount");
@@ -26,9 +21,10 @@ public class ShaderPreviewRenderer : IDisposable
     private static readonly int MaskCountProp = Shader.PropertyToID("_MaskCount");
 
     private readonly int width;
-    private readonly int height;
+    private int height;
     private readonly List<RenderTexture> rts = new();
     private readonly List<Material> mats = new();
+    private readonly List<Material> sourceMats = new();
     private ComputeBuffer dummyDetectionBuffer;
     private int cursor;
     private int selectedSlot = -1;
@@ -40,7 +36,7 @@ public class ShaderPreviewRenderer : IDisposable
     public ShaderPreviewRenderer(int resolutionWidth, float aspect = 4f / 3f)
     {
         width = Mathf.Clamp(resolutionWidth, 64, 1024);
-        height = Mathf.Clamp(Mathf.RoundToInt(width / Mathf.Max(0.1f, aspect)), 48, 1024);
+        height = ComputeHeight(width, aspect);
 
         // A 1-element zero buffer so shaders that declare StructuredBuffer<Detection>
         // have something bound (unbound structured buffers are undefined on some GPUs).
@@ -49,9 +45,33 @@ public class ShaderPreviewRenderer : IDisposable
         dummyDetectionBuffer.SetData(new ShaderDetection[1]);
     }
 
+    private static int ComputeHeight(int w, float aspect) =>
+        Mathf.Clamp(Mathf.RoundToInt(w / Mathf.Max(0.1f, aspect)), 48, 1024);
+
+    /// <summary>
+    /// Updates preview texture aspect ratio when the live camera feed changes resolution
+    /// (e.g. 1280x1280 1:1 on Horizon OS v83+ after a 4:3 fallback before camera start).
+    /// </summary>
+    public bool UpdateAspect(float aspect)
+    {
+        int newHeight = ComputeHeight(width, aspect);
+        if (newHeight == height) return false;
+
+        height = newHeight;
+        for (int i = 0; i < rts.Count; i++)
+        {
+            if (rts[i] != null)
+            {
+                DestroyRenderTexture(rts[i]);
+                rts[i] = CreatePreviewRT();
+            }
+        }
+        return true;
+    }
+
     /// <summary>
     /// Ensures a preview slot exists for the given shader material and returns its RT.
-    /// Safe to call repeatedly (idempotent per slot).
+    /// Reuses existing RenderTextures and Material copies across menu refreshes when unchanged.
     /// </summary>
     public RenderTexture EnsureSlot(int slot, Material sourceMaterial)
     {
@@ -61,30 +81,60 @@ public class ShaderPreviewRenderer : IDisposable
         {
             rts.Add(null);
             mats.Add(null);
+            sourceMats.Add(null);
         }
 
-        if (rts[slot] == null)
+        if (rts[slot] == null || !rts[slot].IsCreated() || rts[slot].height != height)
         {
-            var rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32)
-            {
-                filterMode = FilterMode.Bilinear,
-                wrapMode = TextureWrapMode.Clamp,
-                useMipMap = false,
-            };
-            rt.Create();
-            rts[slot] = rt;
+            if (rts[slot] != null) DestroyRenderTexture(rts[slot]);
+            rts[slot] = CreatePreviewRT();
         }
 
-        if (mats[slot] == null && sourceMaterial != null)
+        if (sourceMaterial != null && (mats[slot] == null || sourceMats[slot] != sourceMaterial))
         {
+            if (mats[slot] != null) UnityEngine.Object.Destroy(mats[slot]);
+
             // Private copy so binding preview state never disturbs the shared history
             // material used by the main view.
             var m = new Material(sourceMaterial);
+            m.SetFloat(EyeIndexProp, -1f); // render in 2D preview regardless of stereo eye gate
             BindZeroDetections(m);
             mats[slot] = m;
+            sourceMats[slot] = sourceMaterial;
         }
 
         return rts[slot];
+    }
+
+    /// <summary>
+    /// Trims excess preview slots when history shrinks without destroying reusable slots.
+    /// </summary>
+    public void TrimSlots(int count)
+    {
+        count = Mathf.Max(0, count);
+        for (int i = rts.Count - 1; i >= count; i--)
+        {
+            if (rts[i] != null) DestroyRenderTexture(rts[i]);
+            if (mats[i] != null) UnityEngine.Object.Destroy(mats[i]);
+            rts.RemoveAt(i);
+            mats.RemoveAt(i);
+            sourceMats.RemoveAt(i);
+        }
+
+        if (cursor >= mats.Count) cursor = 0;
+        if (selectedSlot >= mats.Count) selectedSlot = -1;
+    }
+
+    private RenderTexture CreatePreviewRT()
+    {
+        var rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32)
+        {
+            filterMode = FilterMode.Bilinear,
+            wrapMode = TextureWrapMode.Clamp,
+            useMipMap = false,
+        };
+        rt.Create();
+        return rt;
     }
 
     /// <summary>
@@ -96,8 +146,6 @@ public class ShaderPreviewRenderer : IDisposable
     {
         if (slot == selectedSlot) return;
 
-        // Revert the previous selection, and start the new one clean (passthrough) until
-        // its detections are (re)bound by the caller.
         if (selectedSlot >= 0 && selectedSlot < mats.Count && mats[selectedSlot] != null)
         {
             BindZeroDetections(mats[selectedSlot]);
@@ -124,12 +172,12 @@ public class ShaderPreviewRenderer : IDisposable
         {
             var sm = mats[selectedSlot];
             bindSelectedDetections?.Invoke(sm);
-            try { sm.SetTexture(BaseMapProp, cameraFeed); } catch { }
+            if (sm.HasProperty(BaseMapProp)) sm.SetTexture(BaseMapProp, cameraFeed);
             Graphics.Blit(cameraFeed, rts[selectedSlot], sm);
         }
 
         // Remaining slots: throttled round-robin, zero detections.
-        int budget = Mathf.Max(1, PreviewsPerFrame);
+        int budget = Mathf.Min(Mathf.Max(1, PreviewsPerFrame), mats.Count);
         for (int k = 0; k < budget; k++)
         {
             cursor = (cursor + 1) % mats.Count;
@@ -139,7 +187,7 @@ public class ShaderPreviewRenderer : IDisposable
             var rt = rts[cursor];
             if (m == null || rt == null) continue;
 
-            try { m.SetTexture(BaseMapProp, cameraFeed); } catch { }
+            if (m.HasProperty(BaseMapProp)) m.SetTexture(BaseMapProp, cameraFeed);
             Graphics.Blit(cameraFeed, rt, m);
         }
     }
@@ -147,21 +195,27 @@ public class ShaderPreviewRenderer : IDisposable
     private void BindZeroDetections(Material m)
     {
         if (m == null) return;
-        try { m.SetBuffer(DetectionsProp, dummyDetectionBuffer); } catch { /* no _Detections */ }
-        try { m.SetInt(DetectionCountProp, 0); } catch { }
-        try { m.SetInt(HasMaskProp, 0); } catch { }
-        try { m.SetInt(MaskCountProp, 0); } catch { }
+        m.SetBuffer(DetectionsProp, dummyDetectionBuffer);
+        m.SetInt(DetectionCountProp, 0);
+        m.SetInt(HasMaskProp, 0);
+        m.SetInt(MaskCountProp, 0);
+    }
+
+    private static void DestroyRenderTexture(RenderTexture rt)
+    {
+        if (rt == null) return;
+        rt.Release();
+        UnityEngine.Object.Destroy(rt);
     }
 
     /// <summary>
-    /// Releases all slot textures and material copies (e.g. when the history changes),
-    /// keeping the renderer reusable.
+    /// Releases all slot textures and material copies, keeping the renderer reusable.
     /// </summary>
     public void ClearSlots()
     {
         foreach (var rt in rts)
         {
-            if (rt != null) rt.Release();
+            if (rt != null) DestroyRenderTexture(rt);
         }
         foreach (var m in mats)
         {
@@ -169,6 +223,7 @@ public class ShaderPreviewRenderer : IDisposable
         }
         rts.Clear();
         mats.Clear();
+        sourceMats.Clear();
         cursor = 0;
         selectedSlot = -1;
     }
